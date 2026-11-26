@@ -299,7 +299,7 @@
     "hint": "使用点号和下标访问 JSON 字段，例如 translatedText、data.text 或 translations.0.text。"
   },
   "ai_settings": {
-    "description": "AI 翻译与识图设置（/fyai & 图片翻译）",
+    "description": "AI 翻译与识图设置（/aify & 图片翻译）",
     "type": "object",
     "collapsed": false,
     "items": {
@@ -308,13 +308,13 @@
         "type": "string",
         "default": "",
         "_special": "select_provider",
-        "hint": "选择用于 /fyai 手动 AI 翻译与图片翻译的 AstrBot 模型提供商（支持在下拉框内搜索或直接编辑）；留空则自动使用当前会话的默认提供商。"
+        "hint": "选择用于 /aify 手动 AI 翻译与图片翻译的 AstrBot 模型提供商（支持在下拉框内搜索或直接编辑）；留空则自动使用当前会话的默认提供商。"
       },
       "enable_image_translation": {
         "description": "收到图片或引用图片时自动调用 AI 识别并翻译",
         "type": "bool",
         "default": true,
-        "hint": "发送图片并附带 /fy、/fyai（或引用含图消息）时，自动调用上方配置的多模态 AI 识别图内文字并翻译。"
+        "hint": "发送图片并附带 /fy、/aify（或引用含图消息）时，自动调用上方配置的多模态 AI 识别图内文字并翻译。"
       },
       "image_system_prompt": {
         "description": "图片翻译自定义系统提示词（可选）",
@@ -342,23 +342,40 @@
         "description": "AI 翻译唤醒词（强制调用 AI 提供商）",
         "type": "list",
         "default": [
-          "/fyai",
+          "/aify",
           "/ai翻译"
         ],
-        "hint": "内置默认 /fyai、/ai翻译，可自由增删或修改（例如 /aitl、/ai、!fyai 等）；清空列表则停用 AI 翻译唤醒词，触发后会强制调用 AI 提供商进行翻译。"
+        "hint": "内置默认 /aify、/ai翻译，可自由增删或修改（例如 /aitl、/ai、!aify 等）；清空列表则停用 AI 翻译唤醒词，触发后会强制调用 AI 提供商进行翻译。"
+      },
+      "wake_schema_version": {
+        "description": "唤醒词配置版本（内部迁移用）",
+        "type": "int",
+        "default": 0,
+        "invisible": true
       }
     }
   },
   "voice_settings": {
     "description": "语音发音设置（云端 TTS）",
     "type": "object",
-    "collapsed": true,
+    "collapsed": false,
     "items": {
       "enable_voice": {
-        "description": "允许使用 -v / --voice / --tts / --say 触发语音发音",
+        "description": "允许在指令中使用语音触发词发音",
         "type": "bool",
         "default": true,
         "hint": "使用云端 TTS（Bing / 有道 / Google）直接生成语音。注：AstrBot 发送语音消息（Record）内部需调用 ffmpeg 将云端 MP3 转为 WAV/SILK；若环境未装 ffmpeg，会自动降级发送 MP3 音频文件。"
+      },
+      "voice_triggers": {
+        "description": "语音触发词（在翻译指令中附带即触发发音）",
+        "type": "list",
+        "default": [
+          "-v",
+          "--voice",
+          "--tts",
+          "--say"
+        ],
+        "hint": "内置默认 -v、--voice、--tts、--say，可自由增删或修改（例如 -y、语音、朗读 等）；放在指令开头或结尾均可触发发音，清空列表则仅通过下方“单词自动发音”控制。"
       },
       "auto_voice_for_words": {
         "description": "单词/短语翻译自动附带发音语音",

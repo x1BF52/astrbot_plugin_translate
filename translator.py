@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import functools
 import hashlib
 import hmac
 import html
@@ -14,7 +15,7 @@ import re
 import time
 import urllib.parse
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -759,6 +760,7 @@ _THAI_PATTERN = re.compile(r"[\u0e00-\u0e7f]")
 _LATIN_PATTERN = re.compile(r"[A-Za-z\u00c0-\u024f]")
 # Strictly Japanese Shinjitai characters not used in standard Simplified or Traditional Chinese.
 _JA_SHINJITAI_PATTERN = re.compile(r"[県駅気庁図広桜沢渋売乗変伝仮価薬観読続仏検営関栄転]")
+DEFAULT_VOICE_FLAGS: tuple[str, ...] = ("-v", "--voice", "--tts", "--say")
 _VOICE_FLAG_PATTERN = re.compile(
     r"^(?:--say|--tts|--voice|-v)(?:$|[\s\r\n]+([\s\S]*))$",
     flags=re.IGNORECASE,
@@ -767,6 +769,23 @@ _TRAILING_VOICE_FLAG_PATTERN = re.compile(
     r"^([\s\S]*?)[\s\r\n]+(?:--say|--tts|--voice|-v)$",
     flags=re.IGNORECASE,
 )
+
+
+@functools.lru_cache(maxsize=64)
+def _compile_voice_patterns(
+    flags: tuple[str, ...],
+) -> tuple[re.Pattern[str], re.Pattern[str]]:
+    ordered = sorted(flags, key=len, reverse=True)
+    lead_branches = [
+        f"{re.escape(f)}\\s*"
+        if f[-1] in {":", "："}
+        else f"{re.escape(f)}(?:$|[\\s\\r\\n]+)"
+        for f in ordered
+    ]
+    trail_alts = "|".join(re.escape(f) for f in ordered)
+    lead_re = re.compile(rf"^(?:{'|'.join(lead_branches)})([\s\S]*)$", flags=re.IGNORECASE)
+    trail_re = re.compile(rf"^([\s\S]*?)[\s\r\n]+(?:{trail_alts})$", flags=re.IGNORECASE)
+    return lead_re, trail_re
 
 
 def _has_japanese_marker(text: str, han_count: int, latin_count: int) -> bool:
@@ -877,14 +896,29 @@ def resolve_target_lang(
     return normalize_lang(default_target, allow_auto=False) or "zh-CN"
 
 
-def _strip_voice_flag(raw: str) -> tuple[bool, str]:
+def _strip_voice_flag(
+    raw: str,
+    voice_flags: Sequence[str] | None = None,
+) -> tuple[bool, str]:
+    if voice_flags is None:
+        flags = DEFAULT_VOICE_FLAGS
+    else:
+        flags = tuple(dict.fromkeys(str(f).strip() for f in voice_flags if str(f).strip()))
+    if not flags:
+        return False, raw
+
+    if flags == DEFAULT_VOICE_FLAGS:
+        lead_re, trail_re = _VOICE_FLAG_PATTERN, _TRAILING_VOICE_FLAG_PATTERN
+    else:
+        lead_re, trail_re = _compile_voice_patterns(flags)
+
     stripped = raw.strip()
     found = False
-    lead_match = _VOICE_FLAG_PATTERN.match(stripped)
+    lead_match = lead_re.match(stripped)
     if lead_match:
         found = True
         stripped = (lead_match.group(1) or "").strip()
-    trail_match = _TRAILING_VOICE_FLAG_PATTERN.match(stripped)
+    trail_match = trail_re.match(stripped)
     if trail_match:
         found = True
         stripped = (trail_match.group(1) or "").strip()
@@ -895,10 +929,11 @@ def parse_command_args(
     raw_body: str,
     has_reply: bool = False,
     has_media: bool = False,
+    voice_flags: Sequence[str] | None = None,
 ) -> ParsedCommand:
     """Parse flags, optional inline language specifier, and translation text."""
     stripped = raw_body.strip()
-    voice, stripped = _strip_voice_flag(stripped)
+    voice, stripped = _strip_voice_flag(stripped, voice_flags)
     if not stripped:
         return ParsedCommand(
             action="translate" if (has_reply or has_media) else "help",
@@ -922,7 +957,9 @@ def parse_command_args(
     if flag_match:
         tgt = normalize_lang(flag_match.group(1), allow_auto=False)
         if tgt:
-            trailing_voice, body_text = _strip_voice_flag(flag_match.group(2) or "")
+            trailing_voice, body_text = _strip_voice_flag(
+                flag_match.group(2) or "", voice_flags
+            )
             return ParsedCommand(
                 action="translate",
                 target_lang=tgt,
@@ -940,7 +977,7 @@ def parse_command_args(
         tgt = normalize_lang(raw_tgt, allow_auto=False)
         src = normalize_lang(raw_src, allow_auto=True) if raw_src else "auto"
         if tgt and (not raw_src or src):
-            trailing_voice, body_text = _strip_voice_flag(rest or "")
+            trailing_voice, body_text = _strip_voice_flag(rest or "", voice_flags)
             return ParsedCommand(
                 action="translate",
                 source_lang=src or "auto",
@@ -957,7 +994,9 @@ def parse_command_args(
     if colon_match:
         tgt = normalize_lang(colon_match.group(1), allow_auto=False)
         if tgt:
-            trailing_voice, body_text = _strip_voice_flag(colon_match.group(2) or "")
+            trailing_voice, body_text = _strip_voice_flag(
+                colon_match.group(2) or "", voice_flags
+            )
             return ParsedCommand(
                 action="translate",
                 target_lang=tgt,
@@ -969,7 +1008,7 @@ def parse_command_args(
     parts = re.split(r"(\s+)", stripped, maxsplit=1)
     first_token = parts[0]
     rest_text = parts[2].strip() if len(parts) == 3 else ""
-    trailing_voice, rest_after_voice = _strip_voice_flag(rest_text)
+    trailing_voice, rest_after_voice = _strip_voice_flag(rest_text, voice_flags)
     if trailing_voice:
         rest_text = rest_after_voice
         voice = True

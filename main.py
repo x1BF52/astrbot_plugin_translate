@@ -20,6 +20,7 @@ from astrbot.api.star import Context, Star
 from astrbot.core.star.filter.command import GreedyStr
 
 from .translator import (
+    DEFAULT_VOICE_FLAGS,
     LANG_LABELS,
     PROVIDER_PRESETS,
     SpeechResult,
@@ -43,7 +44,8 @@ _QQ_OFFICIAL_IMAGE_URL_PATTERN = re.compile(
     r"\[附件\d+\][^\n]*?类型:图片[^\n]*?URL:(https?://\S+)"
 )
 _DEFAULT_NORMAL_TRIGGERS = ("/fy", "/翻译")
-_DEFAULT_AI_TRIGGERS = ("/fyai", "/ai翻译")
+_DEFAULT_AI_TRIGGERS = ("/aify", "/ai翻译")
+_WAKE_SCHEMA_VERSION = 2
 _ACTIVE_PLUGIN: "TranslatePlugin | None" = None
 
 _BaseCustomFilter = getattr(filter, "CustomFilter", object)
@@ -74,7 +76,7 @@ class _DynamicWakeFilter(_BaseCustomFilter):
 
 
 class TranslatePlugin(Star):
-    """AstrBot 翻译插件：支持 /fy、/翻译、/fyai 与自定义唤醒词，内置常见免费 API 与多模态/语音能力。"""
+    """AstrBot 翻译插件：支持 /fy、/翻译、/aify 与自定义唤醒词，内置常见免费 API 与多模态/语音能力。"""
 
     def __init__(self, context: Context, config: AstrBotConfig | dict | None = None):
         global _ACTIVE_PLUGIN
@@ -83,7 +85,87 @@ class TranslatePlugin(Star):
         self._session: aiohttp.ClientSession | None = None
         self._service = TranslationService(self._get_session)
         _ACTIVE_PLUGIN = self
+        self._migrate_wake_settings()
         self._sync_command_filters()
+
+    def _migrate_wake_settings(self) -> None:
+        """Migrate legacy empty wake lists and /fyai triggers once via wake_schema_version."""
+        wake_cfg = self.config.get("wake_settings")
+        if not isinstance(wake_cfg, dict):
+            return
+        try:
+            version = int(wake_cfg.get("wake_schema_version") or 0)
+        except (TypeError, ValueError):
+            version = 0
+        if version >= _WAKE_SCHEMA_VERSION:
+            return
+
+        changed = False
+        has_legacy_flag = "enable_default_fy" in wake_cfg
+        legacy_enable = bool(wake_cfg.get("enable_default_fy", True))
+
+        if version < 1 and (not has_legacy_flag or legacy_enable):
+            if "custom_wake_words" in wake_cfg:
+                existing_normal = parse_trigger_list(wake_cfg.get("custom_wake_words"))
+                if not existing_normal:
+                    wake_cfg["custom_wake_words"] = list(_DEFAULT_NORMAL_TRIGGERS)
+                    changed = True
+                elif has_legacy_flag and legacy_enable:
+                    merged_normal = list(_DEFAULT_NORMAL_TRIGGERS)
+                    for item in existing_normal:
+                        if item not in merged_normal:
+                            merged_normal.append(item)
+                    if merged_normal != existing_normal:
+                        wake_cfg["custom_wake_words"] = merged_normal
+                        changed = True
+            if "custom_ai_wake_words" in wake_cfg:
+                existing_ai = parse_trigger_list(wake_cfg.get("custom_ai_wake_words"))
+                if not existing_ai:
+                    wake_cfg["custom_ai_wake_words"] = list(_DEFAULT_AI_TRIGGERS)
+                    changed = True
+                elif has_legacy_flag and legacy_enable:
+                    merged_ai = list(_DEFAULT_AI_TRIGGERS)
+                    for item in existing_ai:
+                        if item not in merged_ai:
+                            merged_ai.append(item)
+                    if merged_ai != existing_ai:
+                        wake_cfg["custom_ai_wake_words"] = merged_ai
+                        changed = True
+            if has_legacy_flag:
+                wake_cfg.pop("enable_default_fy", None)
+                changed = True
+
+        if version < 2 and isinstance(wake_cfg.get("custom_ai_wake_words"), list):
+            raw_ai = wake_cfg.get("custom_ai_wake_words") or []
+            migrated_ai: list[str] = []
+            ai_changed = False
+            for item in raw_ai:
+                token = str(item or "").strip()
+                if not token:
+                    continue
+                if token.lower() == "/fyai":
+                    token = "/aify"
+                    ai_changed = True
+                elif token.lower() == "fyai":
+                    token = "aify"
+                    ai_changed = True
+                if token not in migrated_ai:
+                    migrated_ai.append(token)
+                else:
+                    ai_changed = True
+            if ai_changed:
+                wake_cfg["custom_ai_wake_words"] = migrated_ai
+                changed = True
+
+        if wake_cfg.get("wake_schema_version") != _WAKE_SCHEMA_VERSION:
+            wake_cfg["wake_schema_version"] = _WAKE_SCHEMA_VERSION
+            changed = True
+
+        if changed and hasattr(self.config, "save_config"):
+            try:
+                self.config.save_config()
+            except Exception as exc:
+                logger.debug("保存唤醒词迁移配置失败: %s", exc)
 
     async def initialize(self) -> None:
         """Initialize shared HTTP client session and sync custom command aliases on load."""
@@ -159,6 +241,13 @@ class TranslatePlugin(Star):
             )
 
         return normal, ai
+
+    def _get_voice_triggers(self) -> list[str]:
+        """Return configured voice/TTS flag tokens; explicit empty list disables flags."""
+        voice_cfg = self.config.get("voice_settings") or {}
+        if "voice_triggers" in voice_cfg:
+            return parse_trigger_list(voice_cfg.get("voice_triggers"))
+        return list(DEFAULT_VOICE_FLAGS)
 
     @staticmethod
     def _has_explicit_symbol(trigger: str) -> bool:
@@ -818,17 +907,27 @@ class TranslatePlugin(Star):
         )
         normal_trigs, ai_trigs = self._get_configured_triggers()
         ex_cmd = normal_trigs[0] if normal_trigs else (ai_trigs[0] if ai_trigs else "/fy")
+        voice_trigs = self._get_voice_triggers()
         if self._use_markdown():
             normal_disp = (
                 "、".join(f"`{w}`" for w in normal_trigs) if normal_trigs else "（已停用）"
             )
             ai_disp = "、".join(f"`{w}`" for w in ai_trigs) if ai_trigs else "（已停用）"
+            if voice_trigs:
+                v_ex = voice_trigs[0]
+                v_more = " / ".join(f"`{w}`" for w in voice_trigs[1:3])
+                voice_line = (
+                    f"- 附带发音：`{ex_cmd} {v_ex} <文本>` 或 `{ex_cmd} 日语 {v_ex} 你好`"
+                    + (f"（也支持 {v_more}）\n" if v_more else "\n")
+                )
+            else:
+                voice_line = "- 附带发音：已关闭手动发音参数\n"
             return (
                 "**翻译插件使用说明**\n"
                 f"- 普通翻译：{normal_disp} `<文本>`（单词/短语自动附带词性与多义）\n"
                 f"- AI 翻译：{ai_disp} `<文本>` 手动强制使用 AI 大模型翻译\n"
                 f"- 发送图片或引用图片并发送 `{ex_cmd}`（可加目标语如 `{ex_cmd} 日语`）自动识图翻译\n"
-                f"- 附带发音：`{ex_cmd} -v <文本>` 或 `{ex_cmd} 日语 -v 你好`（也支持 `--voice` / `--tts`）\n"
+                f"{voice_line}"
                 f"- 引用任意消息并发送 `{ex_cmd}`（支持加目标语如 `{ex_cmd} en`）\n"
                 f"- 指定目标语：`{ex_cmd} 日语 你好` | `{ex_cmd} ->ja 你好` | `{ex_cmd} en->zh Hello`\n"
                 f"- 查看支持语种：`{ex_cmd} --langs` | 查看配置状态：`{ex_cmd} --status`\n\n"
@@ -836,12 +935,21 @@ class TranslatePlugin(Star):
             )
         normal_disp_plain = "、".join(normal_trigs) if normal_trigs else "（已停用）"
         ai_disp_plain = "、".join(ai_trigs) if ai_trigs else "（已停用）"
+        if voice_trigs:
+            v_ex = voice_trigs[0]
+            v_more_plain = " / ".join(voice_trigs[1:3])
+            voice_line_plain = (
+                f"• 附带发音：{ex_cmd} {v_ex} <文本> 或 {ex_cmd} 日语 {v_ex} 你好"
+                + (f"（支持 {v_more_plain}）\n" if v_more_plain else "\n")
+            )
+        else:
+            voice_line_plain = "• 附带发音：已关闭手动发音参数\n"
         return (
             "翻译插件使用说明：\n"
             f"• 普通翻译：{normal_disp_plain} <文本>（单词/短语自动附带词性与多义）\n"
             f"• AI 翻译：{ai_disp_plain} <文本> 手动强制使用 AI 大模型翻译\n"
             f"• 发送或引用图片并输入 {ex_cmd}（可加目标语如 {ex_cmd} 日语）自动识图翻译\n"
-            f"• 附带发音：{ex_cmd} -v <文本> 或 {ex_cmd} 日语 -v 你好（支持 --voice / --tts）\n"
+            f"{voice_line_plain}"
             f"• 引用任意消息并发送 {ex_cmd}（支持加目标语如 {ex_cmd} en）\n"
             f"• 指定目标语：{ex_cmd} 日语 你好  |  {ex_cmd} ->ja 你好  |  {ex_cmd} en->zh Hello\n"
             f"• 查看支持语种：{ex_cmd} --langs  |  查看配置状态：{ex_cmd} --status\n"
@@ -923,8 +1031,12 @@ class TranslatePlugin(Star):
             "google_tts": "Google 语音",
             "astrbot_tts": "AstrBot 内置 TTS",
         }
+        voice_trigs = self._get_voice_triggers()
+        voice_trigs_desc = "、".join(voice_trigs) if voice_trigs else "无"
         voice_status = (
-            f"开启（{tts_labels.get(tts_prov, tts_prov)}）" if voice_enabled else "已关闭"
+            f"开启（{tts_labels.get(tts_prov, tts_prov)} | 触发词: {voice_trigs_desc}）"
+            if voice_enabled
+            else "已关闭"
         )
 
         if self._use_markdown():
@@ -932,7 +1044,7 @@ class TranslatePlugin(Star):
                 "**当前翻译配置状态**\n"
                 f"- **主接口**：{preset.name}\n"
                 f"- **接口地址**：`{active_url}`\n"
-                f"- **AI 提供商（/fyai & 识图）**：`{ai_prov_desc}`\n"
+                f"- **AI 提供商（/aify & 识图）**：`{ai_prov_desc}`\n"
                 f"- **唤醒指令**：{wake_desc}\n"
                 f"- **默认目标**：{target_desc}\n"
                 f"- **图片翻译**：{img_status}\n"
@@ -946,7 +1058,7 @@ class TranslatePlugin(Star):
             "当前翻译配置状态：\n"
             f"• 主接口：{preset.name}\n"
             f"• 接口地址：{active_url}\n"
-            f"• AI 提供商（/fyai & 识图）：{ai_prov_desc}\n"
+            f"• AI 提供商（/aify & 识图）：{ai_prov_desc}\n"
             f"• 唤醒指令：{wake_desc}\n"
             f"• 默认目标：{target_desc}\n"
             f"• 图片翻译：{img_status}\n"
@@ -1054,7 +1166,7 @@ class TranslatePlugin(Star):
         *,
         force_ai: bool = False,
     ):
-        """Shared execution path for /fy, /fyai, and custom wake-word triggers."""
+        """Shared execution path for /fy, /aify, and custom wake-word triggers."""
         has_reply = self._has_reply_segment(event)
         direct_images = await self._extract_message_images(event)
         raw_body = self._extract_raw_command_body(event, raw_text)
@@ -1062,6 +1174,7 @@ class TranslatePlugin(Star):
             raw_body,
             has_reply=has_reply,
             has_media=bool(direct_images),
+            voice_flags=self._get_voice_triggers(),
         )
 
         if parsed.action == "help":
@@ -1206,9 +1319,9 @@ class TranslatePlugin(Star):
         async for res in self._execute_translate(event, str(text or ""), force_ai=False):
             yield res
 
-    @filter.command("fyai", alias={"ai翻译"})
+    @filter.command("aify", alias={"ai翻译"})
     async def translate_ai_command(self, event: AstrMessageEvent, text: GreedyStr):
-        """手动指定使用 AI 大模型进行翻译，支持 /fyai 与 /ai翻译。"""
+        """手动指定使用 AI 大模型进行翻译，支持 /aify 与 /ai翻译。"""
         async for res in self._execute_translate(event, str(text or ""), force_ai=True):
             yield res
 
