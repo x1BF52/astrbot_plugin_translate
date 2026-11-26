@@ -10,8 +10,10 @@ import json
 import os
 import pathlib
 import sys
+import tempfile
 import types
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -79,6 +81,34 @@ def _ensure_stubs():
         def __init__(self, qq: str = "0"):
             self.qq = qq
 
+    class Image:
+        def __init__(self, file: str = "", url: str = "", path: str = "", b64: str = ""):
+            self.file = file
+            self.url = url
+            self.path = path
+            self._b64 = b64
+
+        async def convert_to_base64(self):
+            if self._b64:
+                return self._b64
+            raise ValueError("no base64")
+
+    class Record:
+        def __init__(self, file: str = "", path: str = "", text: str | None = None):
+            self.file = file
+            self.path = path
+            self.text = text
+
+        @staticmethod
+        def fromFileSystem(path: str, **kwargs):
+            return Record(file=path, path=path, **kwargs)
+
+    class File:
+        def __init__(self, name: str, file: str = "", url: str = ""):
+            self.name = name
+            self.file = file
+            self.url = url
+
     class Context:
         pass
 
@@ -98,6 +128,7 @@ def _ensure_stubs():
             self._messages = messages or []
             self.bot = bot
             self.unified_msg_origin = umo
+            self._temporary_local_files = []
 
         def get_message_str(self):
             return self._msg_str
@@ -107,6 +138,12 @@ def _ensure_stubs():
 
         def plain_result(self, text: str):
             return text
+
+        def chain_result(self, chain):
+            return types.SimpleNamespace(chain=chain)
+
+        def track_temporary_local_file(self, path: str):
+            self._temporary_local_files.append(path)
 
     class _Filter:
         @staticmethod
@@ -126,6 +163,9 @@ def _ensure_stubs():
     astrbot_api_comp.Plain = Plain
     astrbot_api_comp.Reply = Reply
     astrbot_api_comp.At = At
+    astrbot_api_comp.Image = Image
+    astrbot_api_comp.Record = Record
+    astrbot_api_comp.File = File
     astrbot_core_cmd.GreedyStr = GreedyStr
 
     for name, mod in {
@@ -169,12 +209,23 @@ class MockResponse:
     async def text(self, errors="ignore"):
         if isinstance(self._body, str):
             return self._body
+        if isinstance(self._body, (bytes, bytearray)):
+            return bytes(self._body).decode("utf-8", errors=errors)
         return json.dumps(self._body, ensure_ascii=False)
 
     async def json(self, content_type=None):
         if isinstance(self._body, str):
             return json.loads(self._body)
+        if isinstance(self._body, (bytes, bytearray)):
+            return json.loads(bytes(self._body).decode("utf-8", errors="ignore"))
         return self._body
+
+    async def read(self):
+        if isinstance(self._body, (bytes, bytearray)):
+            return bytes(self._body)
+        if isinstance(self._body, str):
+            return self._body.encode("utf-8")
+        return json.dumps(self._body, ensure_ascii=False).encode("utf-8")
 
 
 class MockSession:
@@ -252,6 +303,16 @@ class MetadataAndSchemaTests(unittest.TestCase):
         self.assertIs(adv_items["enable_dict_lookup"]["default"], True)
         self.assertIs(adv_items["output_markdown"]["default"], False)
 
+        # Image translation and voice pronunciation defaults
+        img_items = schema["image_translation"]["items"]
+        self.assertIs(img_items["enable_image_translation"]["default"], True)
+        self.assertEqual(img_items["image_llm_source"]["default"], "auto")
+        voice_items = schema["voice_settings"]["items"]
+        self.assertIs(voice_items["enable_voice"]["default"], True)
+        self.assertIs(voice_items["auto_voice_for_words"]["default"], False)
+        self.assertEqual(voice_items["tts_provider"]["default"], "auto")
+        self.assertEqual(voice_items["voice_target_mode"]["default"], "smart")
+
     def test_metadata_yaml_required_fields(self):
         raw_lines = (PKG_DIR / "metadata.yaml").read_text(encoding="utf-8").splitlines()
         parsed = {}
@@ -314,6 +375,27 @@ class ParserAndHelperTests(unittest.TestCase):
         p = translator.parse_command_args("--to=zh-TW 你好")
         self.assertEqual((p.action, p.target_lang, p.text), ("translate", "zh-TW", "你好"))
 
+        # Media & voice flags
+        p = translator.parse_command_args("", has_media=True)
+        self.assertEqual((p.action, p.target_lang, p.text, p.voice), ("translate", None, "", False))
+        p = translator.parse_command_args("日语", has_media=True)
+        self.assertEqual((p.action, p.target_lang, p.text, p.voice), ("translate", "ja", "", False))
+        p = translator.parse_command_args("-v", has_media=True)
+        self.assertEqual((p.action, p.target_lang, p.text, p.voice), ("translate", None, "", True))
+        p = translator.parse_command_args("-v", has_reply=False, has_media=False)
+        self.assertEqual(p.action, "help")
+
+        p = translator.parse_command_args("-v apple")
+        self.assertEqual((p.action, p.target_lang, p.text, p.voice), ("translate", None, "apple", True))
+        p = translator.parse_command_args("apple --voice")
+        self.assertEqual((p.action, p.target_lang, p.text, p.voice), ("translate", None, "apple", True))
+        p = translator.parse_command_args("日语 -v 你好")
+        self.assertEqual((p.action, p.target_lang, p.text, p.voice), ("translate", "ja", "你好", True))
+        p = translator.parse_command_args("->ja 你好 --tts")
+        self.assertEqual((p.action, p.target_lang, p.text, p.voice), ("translate", "ja", "你好", True))
+        p = translator.parse_command_args("-v en route to work")
+        self.assertEqual((p.action, p.target_lang, p.text, p.voice), ("translate", None, "en route to work", True))
+
     def test_is_word_or_phrase(self):
         self.assertTrue(translator.is_word_or_phrase("run"))
         self.assertTrue(translator.is_word_or_phrase("look up"))
@@ -334,6 +416,48 @@ class ParserAndHelperTests(unittest.TestCase):
         self.assertEqual(translator.resolve_target_lang("안녕하세요", "auto_zh_en"), "zh-CN")
         self.assertEqual(translator.resolve_target_lang("帮我看看这个Error", "auto_zh_en"), "en")
         self.assertEqual(translator.resolve_target_lang("你好", "ja"), "ja")
+        self.assertEqual(translator.detect_script_lang("〒9300322 富山県 中新川郡 上市町 栄町"), "ja")
+        self.assertEqual(translator.detect_script_lang("〒1000001 東京都千代田区"), "ja")
+
+        mixed_addr = (
+            "〒9300322 富山県 中新川郡　上市町 栄町\n"
+            "SAKAECHO,NAKANIIKAWA GUN KAMIICHI MACHI,TOYAMA KEN,〒9300322"
+        )
+        blocks = translator._split_mixed_script_blocks(mixed_addr)
+        self.assertIsNotNone(blocks)
+        self.assertEqual(len(blocks), 2)
+        self.assertEqual(blocks[0][0], "ja")
+        self.assertEqual(blocks[1][0], "latin")
+        self.assertIsNone(translator._split_mixed_script_blocks("Hello world\nHow are you?"))
+
+        self.assertEqual(
+            translator.clean_tts_text("**Hello** `world`\n- line 2", max_chars=50),
+            "Hello world line 2",
+        )
+        self.assertEqual(
+            translator.select_speech_target(
+                "apple",
+                translator.TranslationResult("苹果", "bing_cn", "Bing", "auto", "zh-CN", "en"),
+                mode="smart",
+            ),
+            ("apple", "en"),
+        )
+        self.assertEqual(
+            translator.select_speech_target(
+                "苹果",
+                translator.TranslationResult("apple", "bing_cn", "Bing", "auto", "en", "zh-CN"),
+                mode="smart",
+            ),
+            ("apple", "en"),
+        )
+        self.assertEqual(
+            translator.select_speech_target(
+                "翻成英文",
+                translator.TranslationResult("Hello menu", "astrbot_llm", "LLM", "image", "en", "image"),
+                mode="smart",
+            ),
+            ("Hello menu", "en"),
+        )
 
     def test_template_single_pass_and_secret_redaction(self):
         rendered = translator.render_json_template(
@@ -1003,6 +1127,291 @@ class ServiceAndPluginMockTests(unittest.IsolatedAsyncioTestCase):
 
         await plugin.terminate()
 
+    async def test_mixed_script_block_translation(self):
+        seen_calls = []
+
+        def handler(method, url, kw):
+            if "cn.bing.com/translator" in url:
+                html_page = (
+                    "<script>var params_AbusePreventionHelper = [12345,\"tok_abc\",3600000];"
+                    "IG:\"ABCDEF1234567890ABCDEF\";</script>"
+                    "<div data-iid=\"translator.5023\"></div>"
+                )
+                return MockResponse(200, html_page)
+            if "ttranslatev3" in url:
+                from_lang = kw["data"].get("fromLang", "")
+                txt = kw["data"].get("text", "")
+                seen_calls.append((from_lang, txt))
+                if from_lang == "ja":
+                    return MockResponse(200, [{"detectedLanguage": {"language": "ja"}, "translations": [{"text": "〒9300322 富山县中新川郡上市町荣町"}]}])
+                return MockResponse(200, [{"detectedLanguage": {"language": "en"}, "translations": [{"text": "日本富山县上市町中新川郡荣町，邮编9300322"}]}])
+            return MockResponse(404, {})
+
+        sess = MockSession(handler)
+        svc = translator.TranslationService(lambda: asyncio.sleep(0, result=sess))
+        sample = (
+            "〒9300322 富山県 中新川郡　上市町 栄町\n"
+            "SAKAECHO,NAKANIIKAWA GUN KAMIICHI MACHI,TOYAMA KEN,〒9300322"
+        )
+        res = await svc.translate(
+            text=sample,
+            config={"api_provider": "bing_cn", "enable_auto_fallback": False},
+        )
+        self.assertEqual(len(seen_calls), 2)
+        self.assertEqual(seen_calls[0][0], "ja")
+        self.assertEqual(seen_calls[1][0], "auto-detect")
+        self.assertEqual(res.detected_lang, "ja+en")
+        self.assertIn("日本富山县上市町中新川郡荣町", res.translated_text)
+        self.assertEqual(translator.get_lang_label(res.detected_lang), "日语、英语")
+
+    async def test_image_translation_and_plugin_flow(self):
+        recorded_llm_calls = []
+
+        class VisionContext:
+            def get_config(self, umo=None):
+                return {"wake_prefix": ["/"]}
+
+            async def get_current_chat_provider_id(self, umo=None):
+                return "vision-prov"
+
+            async def llm_generate(self, chat_provider_id, prompt, system_prompt, image_urls=None):
+                recorded_llm_calls.append(
+                    {
+                        "provider_id": chat_provider_id,
+                        "prompt": prompt,
+                        "system_prompt": system_prompt,
+                        "image_urls": image_urls,
+                    }
+                )
+                return types.SimpleNamespace(
+                    role="assistant",
+                    completion_text="<think>ocr</think>拉面菜单：叉烧面 980日元",
+                )
+
+        plugin = plugin_main.TranslatePlugin(
+            VisionContext(),
+            {
+                "api_provider": "bing_cn",
+                "default_target_lang": "auto_zh_en",
+                "enable_auto_fallback": False,
+                "advanced": {"show_original": True},
+            },
+        )
+
+        # Direct image attachment + target language
+        img = Comp.Image(b64="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ")
+        ev_img = AstrMessageEvent("fy 日语", [Comp.Plain("/fy 日语"), img])
+        out_img = [x async for x in plugin.translate_command(ev_img, GreedyStr("日语"))]
+        self.assertEqual(len(out_img), 1)
+        self.assertIn("[图片识别 → 日语]", out_img[0])
+        self.assertIn("拉面菜单：叉烧面 980日元", out_img[0])
+        self.assertNotIn("原文：", out_img[0])
+        self.assertEqual(recorded_llm_calls[-1]["image_urls"], ["base64://iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"])
+
+        # Quoted image via OneBot get_msg fallback
+        class FakeImgAPI:
+            async def call_action(self, action, **kwargs):
+                return {
+                    "data": {
+                        "message": [
+                            {"type": "image", "data": {"url": "https://example.com/sign.png"}}
+                        ]
+                    }
+                }
+
+        ev_quote_img = AstrMessageEvent(
+            "fy",
+            [Comp.Reply(id="88"), Comp.Plain("/fy")],
+            bot=types.SimpleNamespace(api=FakeImgAPI()),
+        )
+        out_quote = [x async for x in plugin.translate_command(ev_quote_img, GreedyStr(""))]
+        self.assertIn("[图片识别 → 智能中英互译]", out_quote[0])
+        self.assertEqual(recorded_llm_calls[-1]["image_urls"], ["https://example.com/sign.png"])
+
+        # OpenAI-compatible vision endpoint + auto fallback when OpenAI fails
+        openai_requests = []
+
+        def openai_handler(method, url, kw):
+            openai_requests.append(kw["json"])
+            if len(openai_requests) == 1:
+                return MockResponse(
+                    200,
+                    {"choices": [{"message": {"content": "OpenAI识图译文"}}]},
+                )
+            return MockResponse(400, {"error": {"message": "not a VLM"}})
+
+        plugin_oai = plugin_main.TranslatePlugin(
+            VisionContext(),
+            {
+                "api_provider": "openai_compat",
+                "custom_api_url": "https://api.example.com/v1/chat/completions",
+                "api_key": "SK_TEST",
+                "openai_model": "gpt-4o-mini",
+                "image_translation": {"image_llm_source": "auto"},
+            },
+        )
+        plugin_oai._service = translator.TranslationService(
+            lambda: asyncio.sleep(0, result=MockSession(openai_handler))
+        )
+        ev_oai = AstrMessageEvent("fy", [Comp.Plain("/fy"), img])
+        out_oai = [x async for x in plugin_oai.translate_command(ev_oai, GreedyStr(""))]
+        self.assertIn("OpenAI识图译文", out_oai[0])
+        user_content = openai_requests[0]["messages"][1]["content"]
+        self.assertTrue(user_content[1]["image_url"]["url"].startswith("data:image/png;base64,"))
+
+        # Second call fails OpenAI vision -> auto falls back to AstrBot built-in multimodal LLM
+        out_oai_fb = [x async for x in plugin_oai.translate_command(ev_oai, GreedyStr(""))]
+        self.assertIn("拉面菜单：叉烧面 980日元", out_oai_fb[0])
+
+        await plugin.terminate()
+        await plugin_oai.terminate()
+
+    async def test_voice_pronunciation_and_tts_fallback(self):
+        fake_mp3 = b"\xff\xf3\x84\xc4" + (b"\x00" * 256)
+        fake_wav = b"RIFF" + (b"\x00" * 4) + b"WAVE" + (b"\x00" * 256)
+        tts_calls = []
+
+        def tts_handler(method, url, kw):
+            tts_calls.append(url)
+            if "cn.bing.com/translator" in url:
+                html_page = (
+                    "<script>var params_AbusePreventionHelper = [12345,\"tok_abc\",3600000];"
+                    "IG:\"ABCDEF1234567890ABCDEF\";</script>"
+                )
+                return MockResponse(200, html_page)
+            if "ttranslatev3" in url:
+                return MockResponse(
+                    200,
+                    [{"detectedLanguage": {"language": "en"}, "translations": [{"text": "苹果"}]}],
+                )
+            if "tfettts" in url:
+                return MockResponse(500, b"")
+            if "dict.youdao.com/dictvoice" in url:
+                return MockResponse(200, fake_mp3)
+            if "sug.so.360.cn" in url or "dict.youdao.com/jsonapi" in url:
+                return MockResponse(200, {})
+            return MockResponse(404, {})
+
+        class NoopContext:
+            def get_config(self, umo=None):
+                return {"wake_prefix": ["/"]}
+
+        sess = MockSession(tts_handler)
+        plugin = plugin_main.TranslatePlugin(
+            NoopContext(),
+            {
+                "api_provider": "bing_cn",
+                "enable_auto_fallback": True,
+                "voice_settings": {
+                    "enable_voice": True,
+                    "tts_provider": "auto",
+                    "voice_target_mode": "smart",
+                },
+            },
+        )
+        plugin._service = translator.TranslationService(lambda: asyncio.sleep(0, result=sess))
+
+        # 1. With ffmpeg available -> sends Comp.Record after text translation
+        ev_rec = AstrMessageEvent("fy -v apple", [Comp.Plain("/fy -v apple")])
+        with mock.patch("shutil.which", return_value="/usr/bin/ffmpeg"):
+            out_rec = [x async for x in plugin.translate_command(ev_rec, GreedyStr("-v apple"))]
+        self.assertEqual(len(out_rec), 2)
+        self.assertIn("苹果", out_rec[0])
+        self.assertIsInstance(out_rec[1].chain[0], Comp.Record)
+        self.assertEqual(out_rec[1].chain[0].text, "apple")
+        self.assertEqual(len(ev_rec._temporary_local_files), 1)
+        self.assertTrue(os.path.exists(ev_rec._temporary_local_files[0]))
+        os.remove(ev_rec._temporary_local_files[0])
+        self.assertTrue(any("tfettts" in u for u in tts_calls))
+        self.assertTrue(any("dictvoice" in u for u in tts_calls))
+
+        # 2. Without ffmpeg -> MP3 gracefully falls back to Comp.File
+        ev_file = AstrMessageEvent("fy -v apple", [Comp.Plain("/fy -v apple")])
+        with mock.patch("shutil.which", return_value=None):
+            out_file = [x async for x in plugin.translate_command(ev_file, GreedyStr("-v apple"))]
+        self.assertEqual(len(out_file), 2)
+        self.assertIsInstance(out_file[1].chain[0], Comp.File)
+        self.assertEqual(out_file[1].chain[0].name, "pronunciation_en.mp3")
+        os.remove(ev_file._temporary_local_files[0])
+
+        # 3. WAV audio from AstrBot built-in TTS sends Comp.Record even without ffmpeg
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+            tf.write(fake_wav)
+            wav_path = tf.name
+        try:
+            class TtsContext(NoopContext):
+                async def get_using_tts_provider_async(self, umo=None):
+                    return types.SimpleNamespace(
+                        get_audio=lambda txt: asyncio.sleep(0, result=wav_path)
+                    )
+
+            plugin_astr_tts = plugin_main.TranslatePlugin(
+                TtsContext(),
+                {
+                    "api_provider": "bing_cn",
+                    "enable_auto_fallback": False,
+                    "voice_settings": {"tts_provider": "astrbot_tts"},
+                },
+            )
+            plugin_astr_tts._service = translator.TranslationService(
+                lambda: asyncio.sleep(0, result=sess)
+            )
+            ev_wav = AstrMessageEvent("fy -v apple", [Comp.Plain("/fy -v apple")])
+            with mock.patch("shutil.which", return_value=None):
+                out_wav = [x async for x in plugin_astr_tts.translate_command(ev_wav, GreedyStr("-v apple"))]
+            self.assertEqual(len(out_wav), 2)
+            self.assertIsInstance(out_wav[1].chain[0], Comp.Record)
+            os.remove(ev_wav._temporary_local_files[0])
+            await plugin_astr_tts.terminate()
+        finally:
+            if os.path.exists(wav_path):
+                os.remove(wav_path)
+
+        # 4. Explicit -v error yields friendly failure message; auto_voice failure stays quiet
+        def broken_tts_handler(method, url, kw):
+            if "cn.bing.com/translator" in url:
+                return MockResponse(200, "<script>var params_AbusePreventionHelper = [1,\"t\",3600000];IG:\"ABCDEF1234567890ABCDEF\";</script>")
+            if "ttranslatev3" in url:
+                return MockResponse(200, [{"detectedLanguage": {"language": "en"}, "translations": [{"text": "苹果"}]}])
+            return MockResponse(500, b"")
+
+        plugin_err = plugin_main.TranslatePlugin(
+            NoopContext(),
+            {
+                "api_provider": "bing_cn",
+                "enable_auto_fallback": False,
+                "voice_settings": {
+                    "enable_voice": True,
+                    "auto_voice_for_words": True,
+                    "tts_provider": "bing_tts",
+                },
+            },
+        )
+        plugin_err._service = translator.TranslationService(
+            lambda: asyncio.sleep(0, result=MockSession(broken_tts_handler))
+        )
+        out_explicit_err = [
+            x
+            async for x in plugin_err.translate_command(
+                AstrMessageEvent("fy -v apple", [Comp.Plain("/fy -v apple")]),
+                GreedyStr("-v apple"),
+            )
+        ]
+        self.assertEqual(len(out_explicit_err), 2)
+        self.assertIn("语音生成失败", out_explicit_err[1])
+
+        out_auto_err = [
+            x
+            async for x in plugin_err.translate_command(
+                AstrMessageEvent("fy apple", [Comp.Plain("/fy apple")]),
+                GreedyStr("apple"),
+            )
+        ]
+        self.assertEqual(len(out_auto_err), 1)
+
+        await plugin.terminate()
+        await plugin_err.terminate()
+
 
 class _UrllibResp:
     def __init__(self, status: int, body_bytes: bytes, final_url: str):
@@ -1021,6 +1430,9 @@ class _UrllibResp:
 
     async def json(self, content_type=None):
         return json.loads(self._body.decode("utf-8", errors="ignore"))
+
+    async def read(self):
+        return self._body
 
 
 class _AsyncContextCall:
@@ -1114,6 +1526,33 @@ class LiveBackendTests(unittest.IsolatedAsyncioTestCase):
                     )
                 if text == "bonjour":
                     self.assertEqual(res.detected_lang, "fr")
+
+        # Mixed Japanese Kanji + Romaji address live check
+        mixed_addr = (
+            "〒9300322 富山県 中新川郡　上市町 栄町\n"
+            "SAKAECHO,NAKANIIKAWA GUN KAMIICHI MACHI,TOYAMA KEN,〒9300322"
+        )
+        res_mixed = await svc.translate(
+            text=mixed_addr,
+            config={"api_provider": "bing_cn", "default_target_lang": "auto_zh_en", "enable_auto_fallback": False},
+        )
+        self.assertIn("富山县", res_mixed.translated_text)
+        self.assertNotIn("TOYAMA 県", res_mixed.translated_text)
+
+        # Live TTS pronunciation check (Bing + Youdao)
+        sp_bing = await svc.synthesize_speech(
+            text="Hello world",
+            lang="en",
+            config={"voice_settings": {"tts_provider": "bing_tts"}, "enable_auto_fallback": False},
+        )
+        self.assertGreater(len(sp_bing.audio_bytes), 1000)
+
+        sp_yd = await svc.synthesize_speech(
+            text="こんにちは",
+            lang="ja",
+            config={"voice_settings": {"tts_provider": "youdao_tts"}, "enable_auto_fallback": False},
+        )
+        self.assertGreater(len(sp_yd.audio_bytes), 1000)
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import html
 import json
+import os
 import random
 import re
 import time
@@ -16,6 +17,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import aiohttp
@@ -32,6 +34,13 @@ DEFAULT_LLM_PROMPT = (
     "formatting. Output ONLY the translated text without explanations."
 )
 
+DEFAULT_LLM_TEXT_PROMPT = (
+    f"{DEFAULT_LLM_PROMPT} If the input mixes multiple languages or pairs native "
+    "script with romanized lines (such as Japanese Kanji and Romaji addresses), "
+    "translate all parts naturally into {target_lang} without leaving romanized "
+    "tokens untranslated or partially converted."
+)
+
 DEFAULT_LLM_DICT_PROMPT = (
     "You are a concise bilingual dictionary and translator. The user provided a "
     "word or short phrase to translate into {target_lang}. Output:\n"
@@ -43,6 +52,15 @@ DEFAULT_LLM_DICT_PROMPT = (
     "is auto-detected, treat it as English unless it is clearly a foreign greeting "
     "or loanword (e.g. bonjour, gracias, danke).\n"
     "Keep the output clean, well-structured, and free of filler."
+)
+
+DEFAULT_LLM_IMAGE_PROMPT = (
+    "You are a professional OCR and multimodal translator. Carefully read all visible "
+    "text in the provided image(s) (signs, menus, screenshots, labels, comics, documents, etc.) "
+    "and translate it accurately into {target_rule}.\n"
+    "If the user supplied additional instructions or context text alongside the image, follow them.\n"
+    "Keep the output concise and well-organized: include key extracted source text followed by "
+    "its natural translation, and do not invent unreadable text."
 )
 
 
@@ -67,11 +85,51 @@ def build_llm_system_prompt(
         tpl = f"{DEFAULT_LLM_DICT_PROMPT}\n{style}"
     else:
         tpl = (
-            DEFAULT_LLM_PROMPT
+            DEFAULT_LLM_TEXT_PROMPT
             if use_markdown
-            else f"{DEFAULT_LLM_PROMPT} Output plain text without extra Markdown formatting."
+            else f"{DEFAULT_LLM_TEXT_PROMPT} Output plain text without extra Markdown formatting."
         )
     return tpl.replace("{target_lang}", target_label).replace("{source_lang}", source_label)
+
+
+def build_llm_image_prompt(
+    *,
+    source_lang: str,
+    target_lang: str | None,
+    default_target: str,
+    use_markdown: bool = False,
+    custom_prompt: str = "",
+) -> str:
+    """Build multimodal LLM system prompt for image OCR + translation."""
+    if target_lang:
+        tgt_label = get_lang_label(target_lang)
+        if source_lang != "auto":
+            src_label = get_lang_label(source_lang)
+            target_rule = f"{tgt_label} (the source text is expected to be {src_label})"
+        else:
+            target_rule = tgt_label
+    elif default_target == "auto_zh_en":
+        target_rule = (
+            "English if the primary text in the image is Chinese, "
+            "or Simplified Chinese otherwise"
+        )
+    else:
+        target_rule = get_lang_label(default_target)
+
+    cleaned_custom = (custom_prompt or "").strip()
+    if cleaned_custom:
+        return (
+            cleaned_custom.replace("{target_rule}", target_rule)
+            .replace("{target_lang}", target_rule)
+            .replace("{source_lang}", get_lang_label(source_lang))
+        )
+
+    style = (
+        "Format cleanly using concise Markdown (section headers/bold labels and bullet lists)."
+        if use_markdown
+        else "Format cleanly using plain text without Markdown syntax (no **, #, or backticks)."
+    )
+    return DEFAULT_LLM_IMAGE_PROMPT.replace("{target_rule}", target_rule) + f"\n{style}"
 
 
 def format_dict_entries_markdown(entries: list[str]) -> list[str]:
@@ -580,6 +638,57 @@ _BING_POS_LABELS = {
     "OTHER": "释义",
 }
 
+_BING_TTS_VOICES: dict[str, tuple[str, str, str]] = {
+    "zh-CN": ("zh-CN", "Female", "zh-CN-XiaoxiaoNeural"),
+    "zh-TW": ("zh-TW", "Female", "zh-TW-HsiaoChenNeural"),
+    "en": ("en-US", "Female", "en-US-AriaNeural"),
+    "ja": ("ja-JP", "Female", "ja-JP-NanamiNeural"),
+    "ko": ("ko-KR", "Female", "ko-KR-SunHiNeural"),
+    "fr": ("fr-FR", "Female", "fr-FR-DeniseNeural"),
+    "de": ("de-DE", "Female", "de-DE-KatjaNeural"),
+    "es": ("es-ES", "Female", "es-ES-ElviraNeural"),
+    "ru": ("ru-RU", "Female", "ru-RU-DariyaNeural"),
+    "pt": ("pt-BR", "Female", "pt-BR-FranciscaNeural"),
+    "it": ("it-IT", "Male", "it-IT-DiegoNeural"),
+    "ar": ("ar-SA", "Male", "ar-SA-HamedNeural"),
+    "th": ("th-TH", "Male", "th-TH-NiwatNeural"),
+    "vi": ("vi-VN", "Male", "vi-VN-NamMinhNeural"),
+    "id": ("id-ID", "Male", "id-ID-ArdiNeural"),
+    "nl": ("nl-NL", "Female", "nl-NL-ColetteNeural"),
+    "pl": ("pl-PL", "Female", "pl-PL-ZofiaNeural"),
+    "tr": ("tr-TR", "Female", "tr-TR-EmelNeural"),
+    "uk": ("uk-UA", "Female", "uk-UA-PolinaNeural"),
+    "he": ("he-IL", "Male", "he-IL-AvriNeural"),
+    "hi": ("hi-IN", "Female", "hi-IN-SwaraNeural"),
+    "ms": ("ms-MY", "Male", "ms-MY-OsmanNeural"),
+    "sv": ("sv-SE", "Female", "sv-SE-SofieNeural"),
+    "da": ("da-DK", "Female", "da-DK-ChristelNeural"),
+    "fi": ("fi-FI", "Female", "fi-FI-NooraNeural"),
+    "no": ("nb-NO", "Female", "nb-NO-PernilleNeural"),
+    "cs": ("cs-CZ", "Male", "cs-CZ-AntoninNeural"),
+    "el": ("el-GR", "Male", "el-GR-NestorasNeural"),
+    "hu": ("hu-HU", "Male", "hu-HU-TamasNeural"),
+    "ro": ("ro-RO", "Male", "ro-RO-EmilNeural"),
+}
+
+_YOUDAO_TTS_LANG_MAP: dict[str, dict[str, str]] = {
+    "en": {"type": "2"},
+    "ja": {"le": "jap"},
+    "ko": {"le": "ko"},
+    "fr": {"le": "fr"},
+    "de": {"le": "de"},
+    "es": {"le": "es"},
+    "ru": {"le": "ru"},
+    "zh-CN": {"le": "zh"},
+    "zh-TW": {"le": "zh"},
+}
+
+_GOOGLE_TTS_LANG_MAP: dict[str, str] = {
+    "zh-CN": "zh-CN",
+    "zh-TW": "zh-TW",
+    "he": "iw",
+}
+
 
 @dataclass
 class ParsedCommand:
@@ -589,6 +698,7 @@ class ParsedCommand:
     source_lang: str = "auto"
     target_lang: str | None = None
     text: str = ""
+    voice: bool = False
 
 
 @dataclass
@@ -606,6 +716,16 @@ class TranslationResult:
     dict_entries: list[str] | None = None
 
 
+@dataclass
+class SpeechResult:
+    """Synthesized pronunciation audio payload."""
+
+    audio_bytes: bytes
+    mime_type: str
+    lang: str
+    source_name: str
+
+
 def normalize_lang(raw: str | None, allow_auto: bool = True) -> str | None:
     """Normalize a user-supplied language code or Chinese name into canonical form."""
     if not raw:
@@ -621,29 +741,129 @@ def get_lang_label(code: str) -> str:
     """Return a human-readable Chinese label for a canonical language code."""
     if not code:
         return "未知"
+    if code == "image":
+        return "图片识别"
+    if code == "auto_zh_en":
+        return "智能中英互译"
+    if "+" in code:
+        parts = [get_lang_label(part) for part in code.split("+") if part.strip()]
+        deduped = list(dict.fromkeys(parts))
+        return "、".join(deduped) if deduped else "未知"
     canonical = normalize_lang(code, allow_auto=True) or code
     return LANG_LABELS.get(canonical, code)
+
+
+_JA_KANA_PATTERN = re.compile(r"[\u3040-\u30ff]")
+_KO_HANGUL_PATTERN = re.compile(r"[\uac00-\ud7af\u1100-\u11ff]")
+_HAN_PATTERN = re.compile(r"[\u4e00-\u9fff]")
+_CYRILLIC_PATTERN = re.compile(r"[\u0400-\u04ff]")
+_ARABIC_PATTERN = re.compile(r"[\u0600-\u06ff]")
+_THAI_PATTERN = re.compile(r"[\u0e00-\u0e7f]")
+_LATIN_PATTERN = re.compile(r"[A-Za-z\u00c0-\u024f]")
+# Strictly Japanese Shinjitai characters not used in standard Simplified or Traditional Chinese.
+_JA_SHINJITAI_PATTERN = re.compile(r"[県駅気庁図広桜沢渋売乗変伝仮価薬観読続仏検営関栄転]")
+_VOICE_FLAG_PATTERN = re.compile(
+    r"^(?:--say|--tts|--voice|-v)(?:$|[\s\r\n]+([\s\S]*))$",
+    flags=re.IGNORECASE,
+)
+_TRAILING_VOICE_FLAG_PATTERN = re.compile(
+    r"^([\s\S]*?)[\s\r\n]+(?:--say|--tts|--voice|-v)$",
+    flags=re.IGNORECASE,
+)
+
+
+def _has_japanese_marker(text: str, han_count: int, latin_count: int) -> bool:
+    """Detect Japanese even when text uses Kanji-only Shinjitai or postal mark 〒."""
+    if _JA_KANA_PATTERN.search(text):
+        return True
+    if han_count <= 0:
+        return False
+    has_shinjitai_or_postal = bool(_JA_SHINJITAI_PATTERN.search(text) or "〒" in text)
+    return has_shinjitai_or_postal and (latin_count == 0 or han_count * 2 >= latin_count)
 
 
 def detect_script_lang(text: str) -> str:
     """Heuristically detect primary script language when an API requires an explicit source."""
     if not text:
         return "en"
-    if re.search(r"[\u3040-\u30ff]", text):
+    han_count = len(_HAN_PATTERN.findall(text))
+    latin_count = len(_LATIN_PATTERN.findall(text))
+    if _has_japanese_marker(text, han_count, latin_count):
         return "ja"
-    if re.search(r"[\uac00-\ud7af\u1100-\u11ff]", text):
+    if _KO_HANGUL_PATTERN.search(text):
         return "ko"
-    han_count = len(re.findall(r"[\u4e00-\u9fff]", text))
-    latin_count = len(re.findall(r"[A-Za-z]", text))
     if han_count > 0 and (latin_count == 0 or han_count * 2 >= latin_count):
         return "zh-CN"
-    if re.search(r"[\u0400-\u04ff]", text):
+    if _CYRILLIC_PATTERN.search(text):
         return "ru"
-    if re.search(r"[\u0600-\u06ff]", text):
+    if _ARABIC_PATTERN.search(text):
         return "ar"
-    if re.search(r"[\u0e00-\u0e7f]", text):
+    if _THAI_PATTERN.search(text):
         return "th"
     return "en"
+
+
+def _classify_line_script(line: str) -> str:
+    """Classify a single line's dominant writing script, or 'neutral' for symbols/whitespace."""
+    s = line.strip()
+    if not s:
+        return "neutral"
+    kana = len(_JA_KANA_PATTERN.findall(s))
+    hangul = len(_KO_HANGUL_PATTERN.findall(s))
+    han = len(_HAN_PATTERN.findall(s))
+    cyrillic = len(_CYRILLIC_PATTERN.findall(s))
+    arabic = len(_ARABIC_PATTERN.findall(s))
+    thai = len(_THAI_PATTERN.findall(s))
+    latin = len(_LATIN_PATTERN.findall(s))
+    has_jp_marker = bool(_JA_SHINJITAI_PATTERN.search(s) or "〒" in s)
+
+    if kana > 0 or (has_jp_marker and han > 0 and han >= latin):
+        return "ja"
+    if hangul > 0 and hangul >= latin:
+        return "ko"
+    if cyrillic > 0 and cyrillic >= latin:
+        return "ru"
+    if arabic > 0 and arabic >= latin:
+        return "ar"
+    if thai > 0 and thai >= latin:
+        return "th"
+    if han > 0 and han * 2 >= latin:
+        return "cjk"
+    if latin > 0:
+        return "latin"
+    return "neutral"
+
+
+def _split_mixed_script_blocks(text: str) -> list[tuple[str, str]] | None:
+    """Split multi-line mixed-script text into contiguous script blocks, or return None if uniform."""
+    if "\n" not in text and "\r" not in text:
+        return None
+    raw_lines = text.splitlines(keepends=True)
+    if len(raw_lines) < 2:
+        return None
+
+    tagged = [(_classify_line_script(ln), ln) for ln in raw_lines]
+    concrete = {tag for tag, _ in tagged if tag != "neutral"}
+    if len(concrete) < 2:
+        return None
+
+    blocks: list[list[Any]] = []
+    for tag, ln in tagged:
+        if not blocks:
+            blocks.append([tag, ln])
+            continue
+        prev_tag = blocks[-1][0]
+        if tag == "neutral" or tag == prev_tag:
+            blocks[-1][1] += ln
+        elif prev_tag == "neutral":
+            blocks[-1][0] = tag
+            blocks[-1][1] += ln
+        else:
+            blocks.append([tag, ln])
+
+    if len(blocks) < 2 or len(blocks) > 12:
+        return None
+    return [(tag, content) for tag, content in blocks]
 
 
 def resolve_target_lang(
@@ -660,11 +880,33 @@ def resolve_target_lang(
     return normalize_lang(default_target, allow_auto=False) or "zh-CN"
 
 
-def parse_command_args(raw_body: str, has_reply: bool = False) -> ParsedCommand:
+def _strip_voice_flag(raw: str) -> tuple[bool, str]:
+    stripped = raw.strip()
+    found = False
+    lead_match = _VOICE_FLAG_PATTERN.match(stripped)
+    if lead_match:
+        found = True
+        stripped = (lead_match.group(1) or "").strip()
+    trail_match = _TRAILING_VOICE_FLAG_PATTERN.match(stripped)
+    if trail_match:
+        found = True
+        stripped = (trail_match.group(1) or "").strip()
+    return (True, stripped) if found else (False, raw)
+
+
+def parse_command_args(
+    raw_body: str,
+    has_reply: bool = False,
+    has_media: bool = False,
+) -> ParsedCommand:
     """Parse flags, optional inline language specifier, and translation text."""
     stripped = raw_body.strip()
+    voice, stripped = _strip_voice_flag(stripped)
     if not stripped:
-        return ParsedCommand(action="translate" if has_reply else "help")
+        return ParsedCommand(
+            action="translate" if (has_reply or has_media) else "help",
+            voice=voice,
+        )
 
     lower = stripped.lower()
     if lower in {"-h", "--help"}:
@@ -683,10 +925,12 @@ def parse_command_args(raw_body: str, has_reply: bool = False) -> ParsedCommand:
     if flag_match:
         tgt = normalize_lang(flag_match.group(1), allow_auto=False)
         if tgt:
+            trailing_voice, body_text = _strip_voice_flag(flag_match.group(2) or "")
             return ParsedCommand(
                 action="translate",
                 target_lang=tgt,
-                text=(flag_match.group(2) or "").strip(),
+                text=body_text,
+                voice=voice or trailing_voice,
             )
 
     # 2. Explicit [src]->tgt (e.g. "->ja hello", "en->zh hello", "中->英 你好")
@@ -699,11 +943,13 @@ def parse_command_args(raw_body: str, has_reply: bool = False) -> ParsedCommand:
         tgt = normalize_lang(raw_tgt, allow_auto=False)
         src = normalize_lang(raw_src, allow_auto=True) if raw_src else "auto"
         if tgt and (not raw_src or src):
+            trailing_voice, body_text = _strip_voice_flag(rest or "")
             return ParsedCommand(
                 action="translate",
                 source_lang=src or "auto",
                 target_lang=tgt,
-                text=(rest or "").strip(),
+                text=body_text,
+                voice=voice or trailing_voice,
             )
 
     # 3. Explicit colon prefix: "ja: hello" or "日语：你好"
@@ -714,23 +960,29 @@ def parse_command_args(raw_body: str, has_reply: bool = False) -> ParsedCommand:
     if colon_match:
         tgt = normalize_lang(colon_match.group(1), allow_auto=False)
         if tgt:
+            trailing_voice, body_text = _strip_voice_flag(colon_match.group(2) or "")
             return ParsedCommand(
                 action="translate",
                 target_lang=tgt,
-                text=(colon_match.group(2) or "").strip(),
+                text=body_text,
+                voice=voice or trailing_voice,
             )
 
     # 4. Space-separated first token (strictly guarded against false positives)
     parts = re.split(r"(\s+)", stripped, maxsplit=1)
     first_token = parts[0]
     rest_text = parts[2].strip() if len(parts) == 3 else ""
+    trailing_voice, rest_after_voice = _strip_voice_flag(rest_text)
+    if trailing_voice:
+        rest_text = rest_after_voice
+        voice = True
     token_lower = first_token.lower()
     tgt = normalize_lang(first_token, allow_auto=False)
 
     if tgt:
-        # Single language token when replying to a quoted message: "/fy en" or "/fy 日语"
-        if not rest_text and has_reply:
-            return ParsedCommand(action="translate", target_lang=tgt, text="")
+        # Single language token when replying/attaching media: "/fy en"
+        if not rest_text and (has_reply or has_media):
+            return ParsedCommand(action="translate", target_lang=tgt, text="", voice=voice)
         # Hyphenated codes (zh-cn, zh-tw) or short codes followed by non-ASCII body
         if rest_text and (
             token_lower in _UNAMBIGUOUS_PREFIX_CODES
@@ -739,9 +991,9 @@ def parse_command_args(raw_body: str, has_reply: bool = False) -> ParsedCommand:
                 and any(ord(ch) > 127 for ch in rest_text[:12])
             )
         ):
-            return ParsedCommand(action="translate", target_lang=tgt, text=rest_text)
+            return ParsedCommand(action="translate", target_lang=tgt, text=rest_text, voice=voice)
 
-    return ParsedCommand(action="translate", text=stripped)
+    return ParsedCommand(action="translate", text=stripped, voice=voice)
 
 
 def chunk_text(text: str, max_chars: int) -> list[str]:
@@ -958,6 +1210,127 @@ def _map_lang(code: str, table: dict[str, str], default: str | None = None) -> s
     return default if default is not None else code
 
 
+def clean_tts_text(text: str, max_chars: int = 300) -> str:
+    """Normalize text for speech synthesis by stripping Markdown and capping length."""
+    cleaned = clean_llm_translation(text or "")
+    cleaned = re.sub(r"`([^`\n]+)`", r"\1", cleaned)
+    cleaned = re.sub(r"\*\*([^*\n]+)\*\*|__([^_\n]+)__", lambda m: m.group(1) or m.group(2), cleaned)
+    cleaned = re.sub(r"(?m)^\s*(?:#{1,6}\s+|[•*-]\s+)", "", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    try:
+        cap = max(50, min(1000, int(max_chars)))
+    except (TypeError, ValueError):
+        cap = 300
+    if len(cleaned) > cap:
+        snippet = cleaned[:cap]
+        last_sep = max(
+            snippet.rfind(" "),
+            snippet.rfind("。"),
+            snippet.rfind("."),
+            snippet.rfind("，"),
+            snippet.rfind(","),
+        )
+        if last_sep >= cap // 2:
+            snippet = snippet[:last_sep]
+        cleaned = snippet.strip()
+    return cleaned
+
+
+def select_speech_target(
+    original: str,
+    res: TranslationResult,
+    mode: str = "smart",
+    max_chars: int = 300,
+) -> tuple[str, str]:
+    """Choose which text and language to pronounce for a translation result."""
+    if res.source_lang == "image":
+        spoken = clean_tts_text(res.translated_text, max_chars=max_chars)
+        lang = (
+            normalize_lang(res.target_lang, allow_auto=False)
+            if res.target_lang not in {"", "auto", "auto_zh_en"}
+            else ""
+        ) or detect_script_lang(spoken)
+        return spoken, lang
+
+    raw_src = (
+        res.source_lang
+        if res.source_lang not in {"auto", ""}
+        else (res.detected_lang or "")
+    )
+    if not raw_src or "+" in raw_src:
+        src_lang = detect_script_lang(original) if original.strip() else ""
+    else:
+        src_lang = normalize_lang(raw_src, allow_auto=False) or detect_script_lang(original)
+
+    tgt_lang = normalize_lang(res.target_lang, allow_auto=False) or detect_script_lang(
+        res.translated_text
+    )
+
+    if mode == "original" and original.strip():
+        chosen_text, chosen_lang = original, src_lang
+    elif mode == "translated" or not original.strip():
+        chosen_text, chosen_lang = res.translated_text, tgt_lang
+    else:
+        # "smart": foreign->Chinese speaks original foreign text; Chinese->foreign or foreign->foreign speaks translation
+        if src_lang not in {"zh-CN", "zh-TW", ""} and tgt_lang in {"zh-CN", "zh-TW"}:
+            chosen_text, chosen_lang = original, src_lang
+        else:
+            chosen_text, chosen_lang = res.translated_text, tgt_lang
+
+    return clean_tts_text(chosen_text, max_chars=max_chars), chosen_lang
+
+
+def _detect_image_mime_from_bytes(header: bytes) -> str:
+    """Sniff image MIME type from magic header bytes."""
+    if header.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if header.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if header.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"WEBP":
+        return "image/webp"
+    if header.startswith(b"BM"):
+        return "image/bmp"
+    return "image/jpeg"
+
+
+def _file_uri_to_local_path(uri: str) -> str:
+    parsed = urllib.parse.urlparse(uri)
+    path = urllib.parse.unquote(parsed.path or "")
+    if len(path) >= 3 and path[0] == "/" and path[2] == ":" and path[1].isalpha():
+        path = path[1:]
+    return path
+
+
+def _image_ref_to_openai_url_sync(ref: str) -> str:
+    """Normalize an image reference into an HTTP(S) or data:image/...;base64,... URL."""
+    val = (ref or "").strip()
+    if not val:
+        raise TranslationError("图片引用为空")
+    if val.startswith(("http://", "https://", "data:")):
+        return val
+    if val.startswith("base64://"):
+        b64 = "".join(val[len("base64://") :].split())
+        sample = b64[:64]
+        pad = (-len(sample)) % 4
+        if pad:
+            sample += "=" * pad
+        try:
+            header = base64.b64decode(sample)
+        except Exception:
+            header = b""
+        mime = _detect_image_mime_from_bytes(header)
+        return f"data:{mime};base64,{b64}"
+    local_path = _file_uri_to_local_path(val) if val.startswith("file://") else val
+    p = Path(local_path)
+    if p.is_file():
+        raw = p.read_bytes()
+        mime = _detect_image_mime_from_bytes(raw[:32])
+        return f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
+    raise TranslationError(f"无法读取本地图片文件: {val[:80]}")
+
+
 class TranslationService:
     """Async multi-engine translation dispatcher with fallback and token caching."""
 
@@ -1063,49 +1436,34 @@ class TranslationService:
         for idx, provider_key in enumerate(chain):
             preset = PROVIDER_PRESETS[provider_key]
             try:
-                translated, detected = await self._dispatch_provider(
-                    preset=preset,
-                    text=text,
-                    source_lang=source_lang,
-                    target_lang=resolved_target,
-                    config=config,
-                    use_custom_override=(idx == 0),
-                    llm_callback=llm_callback,
-                    dict_mode=dict_mode,
-                )
-                cleaned = translated.strip()
-                if not cleaned:
-                    raise TranslationError("返回译文为空")
-
+                use_custom = idx == 0
                 prefetched_yd: dict[str, Any] | None = None
-                det_norm = normalize_lang(detected, allow_auto=False) or ""
-                if (
-                    preset.kind not in {"openai_compat", "astrbot_llm"}
-                    and source_lang == "auto"
-                    and dict_mode
-                    and resolved_target != "en"
-                    and _is_pure_ascii_words(text)
-                    and det_norm != "en"
-                ):
-                    prefetched_yd = await self._fetch_youdao_json(text.strip(), "en", config)
-                    if prefetched_yd and _is_confident_english_ec(prefetched_yd.get("ec")):
-                        detected = "en"
-                        if det_norm in _AMBIGUOUS_LATIN_CODES:
-                            try:
-                                re_translated, _ = await self._dispatch_provider(
-                                    preset=preset,
-                                    text=text,
-                                    source_lang="en",
-                                    target_lang=resolved_target,
-                                    config=config,
-                                    use_custom_override=(idx == 0),
-                                    llm_callback=llm_callback,
-                                    dict_mode=dict_mode,
-                                )
-                                if re_translated.strip():
-                                    cleaned = re_translated.strip()
-                            except Exception:
-                                pass
+                mixed_blocks = (
+                    _split_mixed_script_blocks(text)
+                    if source_lang == "auto"
+                    and preset.kind not in {"openai_compat", "astrbot_llm"}
+                    else None
+                )
+                if mixed_blocks:
+                    cleaned, detected = await self._translate_mixed_blocks(
+                        blocks=mixed_blocks,
+                        preset=preset,
+                        target_lang=resolved_target,
+                        config=config,
+                        use_custom_override=use_custom,
+                        llm_callback=llm_callback,
+                    )
+                else:
+                    cleaned, detected, prefetched_yd = await self._dispatch_with_ascii_guard(
+                        preset=preset,
+                        text=text,
+                        source_lang=source_lang,
+                        target_lang=resolved_target,
+                        config=config,
+                        use_custom_override=use_custom,
+                        llm_callback=llm_callback,
+                        dict_mode=dict_mode,
+                    )
 
                 dict_entries: list[str] | None = None
                 if dict_mode and preset.kind not in {"openai_compat", "astrbot_llm"}:
@@ -1133,6 +1491,114 @@ class TranslationService:
                 errors.append(f"{preset.name}: {safe_err}")
 
         raise TranslationError("；".join(errors) if errors else "所有翻译接口均请求失败")
+
+    async def _dispatch_with_ascii_guard(
+        self,
+        *,
+        preset: ProviderPreset,
+        text: str,
+        source_lang: str,
+        target_lang: str,
+        config: dict[str, Any],
+        use_custom_override: bool,
+        llm_callback: Callable[..., Awaitable[str]] | None,
+        dict_mode: bool,
+    ) -> tuple[str, str, dict[str, Any] | None]:
+        """Dispatch translation and guard short ASCII English words against Latin misdetection."""
+        translated, detected = await self._dispatch_provider(
+            preset=preset,
+            text=text,
+            source_lang=source_lang,
+            target_lang=target_lang,
+            config=config,
+            use_custom_override=use_custom_override,
+            llm_callback=llm_callback,
+            dict_mode=dict_mode,
+        )
+        cleaned = translated.strip()
+        if not cleaned:
+            raise TranslationError("返回译文为空")
+
+        prefetched_yd: dict[str, Any] | None = None
+        det_norm = normalize_lang(detected, allow_auto=False) or ""
+        if (
+            preset.kind not in {"openai_compat", "astrbot_llm"}
+            and source_lang == "auto"
+            and dict_mode
+            and target_lang != "en"
+            and _is_pure_ascii_words(text)
+            and det_norm != "en"
+        ):
+            prefetched_yd = await self._fetch_youdao_json(text.strip(), "en", config)
+            if prefetched_yd and _is_confident_english_ec(prefetched_yd.get("ec")):
+                detected = "en"
+                if det_norm in _AMBIGUOUS_LATIN_CODES:
+                    try:
+                        re_translated, _ = await self._dispatch_provider(
+                            preset=preset,
+                            text=text,
+                            source_lang="en",
+                            target_lang=target_lang,
+                            config=config,
+                            use_custom_override=use_custom_override,
+                            llm_callback=llm_callback,
+                            dict_mode=dict_mode,
+                        )
+                        if re_translated.strip():
+                            cleaned = re_translated.strip()
+                    except Exception:
+                        pass
+        return cleaned, detected, prefetched_yd
+
+    async def _translate_mixed_blocks(
+        self,
+        *,
+        blocks: list[tuple[str, str]],
+        preset: ProviderPreset,
+        target_lang: str,
+        config: dict[str, Any],
+        use_custom_override: bool,
+        llm_callback: Callable[..., Awaitable[str]] | None,
+    ) -> tuple[str, str]:
+        """Translate each script-homogeneous block independently so mixed lines do not cross-corrupt."""
+        rendered_parts: list[str] = []
+        detected_langs: list[str] = []
+        for script_tag, block_raw in blocks:
+            core = block_raw.strip()
+            if not core:
+                rendered_parts.append(block_raw)
+                continue
+            lead_len = len(block_raw) - len(block_raw.lstrip())
+            trail_len = len(block_raw) - len(block_raw.rstrip())
+            lead_ws = block_raw[:lead_len]
+            trail_ws = block_raw[len(block_raw) - trail_len :] if trail_len else ""
+
+            block_src = script_tag if script_tag in {"ja", "ko", "ru", "ar", "th"} else "auto"
+            if block_src == target_lang:
+                block_out = core
+                norm_det = block_src
+            else:
+                block_out, det, _ = await self._dispatch_with_ascii_guard(
+                    preset=preset,
+                    text=core,
+                    source_lang=block_src,
+                    target_lang=target_lang,
+                    config=config,
+                    use_custom_override=use_custom_override,
+                    llm_callback=llm_callback,
+                    dict_mode=False,
+                )
+                norm_det = normalize_lang(det, allow_auto=False) or (
+                    block_src if block_src != "auto" else ""
+                )
+            if norm_det and norm_det not in detected_langs:
+                detected_langs.append(norm_det)
+            rendered_parts.append(f"{lead_ws}{block_out}{trail_ws}")
+
+        merged = "".join(rendered_parts).strip()
+        if not merged:
+            raise TranslationError("返回译文为空")
+        return merged, "+".join(detected_langs)
 
     async def _dispatch_provider(
         self,
@@ -2011,18 +2477,16 @@ class TranslationService:
 
         return await self._translate_chunked(text, 1500, _send_aliyun)
 
-    async def _translate_openai_compat(
+    async def _post_openai_chat(
         self,
+        *,
         preset: ProviderPreset,
         url: str,
-        text: str,
-        source_lang: str,
-        target_lang: str,
         api_key: str,
         config: dict[str, Any],
-        dict_mode: bool = False,
-        **_: Any,
-    ) -> tuple[str, str]:
+        messages: list[dict[str, Any]],
+    ) -> str:
+        """Send an OpenAI-compatible chat completion request and return cleaned text."""
         req_url = url.rstrip("/")
         if not req_url.endswith("/chat/completions"):
             if re.search(r"/(?:v\d+(?:alpha|beta)?|openai)$", req_url, re.IGNORECASE):
@@ -2033,21 +2497,6 @@ class TranslationService:
         model_key = preset.model_config_key or "openai_model"
         model = str(config.get(model_key) or preset.default_model or "gpt-4o-mini").strip()
 
-        custom_prompt = (
-            str(config.get("openai_system_prompt") or "").strip()
-            if preset.key == "openai_compat"
-            else ""
-        )
-        adv = config.get("advanced") or {}
-        use_markdown = bool(adv.get("output_markdown", False))
-        system_prompt = build_llm_system_prompt(
-            custom_prompt,
-            get_lang_label(source_lang),
-            get_lang_label(target_lang),
-            dict_mode=dict_mode,
-            use_markdown=use_markdown,
-        )
-
         headers = {"Content-Type": "application/json"}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
@@ -2055,10 +2504,7 @@ class TranslationService:
         payload = {
             "model": model,
             "temperature": 0.2,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": text},
-            ],
+            "messages": messages,
         }
 
         session = await self._get_session()
@@ -2082,7 +2528,45 @@ class TranslationService:
             )
         if not isinstance(content, str) or not content.strip():
             raise TranslationError("OpenAI 兼容接口未返回有效译文")
-        return clean_llm_translation(content), ""
+        return clean_llm_translation(content)
+
+    async def _translate_openai_compat(
+        self,
+        preset: ProviderPreset,
+        url: str,
+        text: str,
+        source_lang: str,
+        target_lang: str,
+        api_key: str,
+        config: dict[str, Any],
+        dict_mode: bool = False,
+        **_: Any,
+    ) -> tuple[str, str]:
+        custom_prompt = (
+            str(config.get("openai_system_prompt") or "").strip()
+            if preset.key == "openai_compat"
+            else ""
+        )
+        adv = config.get("advanced") or {}
+        use_markdown = bool(adv.get("output_markdown", False))
+        system_prompt = build_llm_system_prompt(
+            custom_prompt,
+            get_lang_label(source_lang),
+            get_lang_label(target_lang),
+            dict_mode=dict_mode,
+            use_markdown=use_markdown,
+        )
+        out = await self._post_openai_chat(
+            preset=preset,
+            url=url,
+            api_key=api_key,
+            config=config,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": text},
+            ],
+        )
+        return out, ""
 
     async def _translate_custom_http(
         self,
@@ -2406,3 +2890,376 @@ class TranslationService:
                 bucket.append(target_word)
 
         return [f"• {pos} {'；'.join(words)}" for pos, words in list(grouped.items())[:6]]
+
+    async def translate_images(
+        self,
+        *,
+        image_urls: list[str],
+        user_text: str,
+        config: dict[str, Any],
+        source_lang: str = "auto",
+        target_lang: str | None = None,
+        astrbot_image_callback: Callable[..., Awaitable[str]] | None = None,
+    ) -> TranslationResult:
+        """Translate visible text in image(s) via multimodal LLM."""
+        if not image_urls:
+            raise TranslationError("未检测到可识别的图片")
+
+        img_cfg = config.get("image_translation") or {}
+        if not bool(img_cfg.get("enable_image_translation", True)):
+            raise TranslationError("图片翻译功能已在配置中关闭")
+
+        adv = config.get("advanced") or {}
+        use_markdown = bool(adv.get("output_markdown", False))
+        default_target = str(config.get("default_target_lang") or "auto_zh_en")
+        custom_prompt = str(img_cfg.get("image_system_prompt") or "").strip()
+        system_prompt = build_llm_image_prompt(
+            source_lang=source_lang,
+            target_lang=target_lang,
+            default_target=default_target,
+            use_markdown=use_markdown,
+            custom_prompt=custom_prompt,
+        )
+        prompt_text = (
+            user_text.strip()
+            if user_text and user_text.strip()
+            else "请识别并翻译图片中的全部可见文字。"
+        )
+        display_target = (
+            target_lang
+            or (
+                "auto_zh_en"
+                if default_target == "auto_zh_en"
+                else (normalize_lang(default_target, allow_auto=False) or "zh-CN")
+            )
+        )
+
+        llm_source = str(img_cfg.get("image_llm_source") or "auto").strip()
+        primary = str(config.get("api_provider") or "bing_cn")
+        provider_id_override = str(img_cfg.get("image_astrbot_provider_id") or "").strip()
+
+        async def _via_astrbot() -> tuple[str, str, str]:
+            if astrbot_image_callback is None:
+                raise TranslationError("当前环境不支持 AstrBot 内置视觉大模型调用")
+            out = await astrbot_image_callback(
+                prompt_text,
+                system_prompt,
+                image_urls,
+                provider_id_override=provider_id_override,
+            )
+            cleaned = clean_llm_translation(out)
+            if not cleaned:
+                raise TranslationError("大模型未返回有效图片翻译结果")
+            return cleaned, "astrbot_llm", "AstrBot 内置大模型 (视觉)"
+
+        async def _via_openai() -> tuple[str, str, str]:
+            out = await self._translate_images_openai_compat(
+                image_urls=image_urls,
+                user_prompt=prompt_text,
+                system_prompt=system_prompt,
+                config=config,
+            )
+            return out, "openai_compat", "OpenAI 兼容接口 (视觉)"
+
+        try_openai_first = llm_source == "openai_compat" or (
+            llm_source == "auto" and primary == "openai_compat"
+        )
+        if try_openai_first:
+            try:
+                translated, pkey, pname = await _via_openai()
+                return TranslationResult(
+                    translated_text=translated,
+                    provider_key=pkey,
+                    provider_name=pname,
+                    source_lang="image",
+                    target_lang=display_target,
+                    detected_lang="image",
+                )
+            except Exception as first_exc:
+                if llm_source == "auto" and astrbot_image_callback is not None:
+                    try:
+                        translated, pkey, pname = await _via_astrbot()
+                        return TranslationResult(
+                            translated_text=translated,
+                            provider_key=pkey,
+                            provider_name=pname,
+                            source_lang="image",
+                            target_lang=display_target,
+                            detected_lang="image",
+                            fallback_used=True,
+                            errors=[redact_config_secrets(str(first_exc), config)],
+                        )
+                    except Exception:
+                        pass
+                raise
+
+        translated, pkey, pname = await _via_astrbot()
+        return TranslationResult(
+            translated_text=translated,
+            provider_key=pkey,
+            provider_name=pname,
+            source_lang="image",
+            target_lang=display_target,
+            detected_lang="image",
+        )
+
+    async def _translate_images_openai_compat(
+        self,
+        *,
+        image_urls: list[str],
+        user_prompt: str,
+        system_prompt: str,
+        config: dict[str, Any],
+    ) -> str:
+        preset = PROVIDER_PRESETS["openai_compat"]
+        url = str(config.get("custom_api_url") or "").strip() or preset.default_url
+        api_key = str(config.get("api_key") or "").strip()
+        if not url or not re.match(r"^https?://", url, re.IGNORECASE):
+            raise TranslationError("未配置有效的 OpenAI 兼容 API 地址")
+
+        content_parts: list[dict[str, Any]] = [{"type": "text", "text": user_prompt}]
+        for ref in image_urls:
+            resolved_url = await asyncio.to_thread(_image_ref_to_openai_url_sync, ref)
+            content_parts.append({"type": "image_url", "image_url": {"url": resolved_url}})
+
+        return await self._post_openai_chat(
+            preset=preset,
+            url=url,
+            api_key=api_key,
+            config=config,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": content_parts},
+            ],
+        )
+
+    @staticmethod
+    def _validate_audio_bytes(data: bytes, provider_name: str) -> str:
+        if not data or len(data) < 128:
+            raise TranslationError(f"{provider_name} 返回音频数据过短或为空")
+        head = data.lstrip()[:24].lower()
+        if head.startswith((b"<html", b"<!doc", b"<?xml", b"<error", b"{", b"[")):
+            raise TranslationError(f"{provider_name} 返回了非音频错误响应")
+        if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WAVE":
+            return "audio/wav"
+        if data[:4] == b"OggS":
+            return "audio/ogg"
+        return "audio/mpeg"
+
+    async def _read_bytes_response(self, resp: Any, provider_name: str) -> tuple[bytes, str]:
+        if resp.status not in range(200, 300):
+            raise TranslationError(f"{provider_name} HTTP {resp.status}")
+        if hasattr(resp, "read"):
+            raw = await resp.read()
+        elif hasattr(resp, "_body") and isinstance(resp._body, (bytes, bytearray)):
+            raw = bytes(resp._body)
+        else:
+            raw = (await resp.text(errors="ignore")).encode("latin1")
+        data = bytes(raw)
+        mime_type = self._validate_audio_bytes(data, provider_name)
+        return data, mime_type
+
+    async def synthesize_speech(
+        self,
+        *,
+        text: str,
+        lang: str,
+        config: dict[str, Any],
+        astrbot_tts_callback: Callable[[str], Awaitable[SpeechResult | bytes | str]] | None = None,
+    ) -> SpeechResult:
+        """Synthesize pronunciation audio using Bing/Youdao/Google free TTS or AstrBot TTS."""
+        voice_cfg = config.get("voice_settings") or {}
+        if not bool(voice_cfg.get("enable_voice", True)):
+            raise TranslationError("语音发音功能已在配置中关闭")
+
+        try:
+            max_chars = int(voice_cfg.get("tts_max_chars", 300))
+        except (TypeError, ValueError):
+            max_chars = 300
+        cleaned = clean_tts_text(text, max_chars=max_chars)
+        if not cleaned:
+            raise TranslationError("没有可用于语音合成的文本内容")
+
+        norm_lang = normalize_lang(lang, allow_auto=False) if lang else None
+        if not norm_lang:
+            norm_lang = detect_script_lang(cleaned)
+
+        selected = str(voice_cfg.get("tts_provider") or "auto").strip()
+        allow_fallback = bool(config.get("enable_auto_fallback", True))
+
+        if selected == "auto":
+            chain = ["bing_tts", "youdao_tts", "google_tts"]
+            if astrbot_tts_callback is not None:
+                chain.append("astrbot_tts")
+        elif selected in {"bing_tts", "youdao_tts", "google_tts", "astrbot_tts"}:
+            chain = [selected]
+            if allow_fallback:
+                for fb in ("bing_tts", "youdao_tts", "google_tts", "astrbot_tts"):
+                    if fb != selected and (fb != "astrbot_tts" or astrbot_tts_callback is not None):
+                        chain.append(fb)
+        else:
+            chain = ["bing_tts", "youdao_tts", "google_tts"]
+
+        errors: list[str] = []
+        for engine in chain:
+            try:
+                if engine == "bing_tts":
+                    return await self._tts_bing(cleaned, norm_lang, config)
+                if engine == "youdao_tts":
+                    return await self._tts_youdao(cleaned, norm_lang, config)
+                if engine == "google_tts":
+                    return await self._tts_google(cleaned, norm_lang, config)
+                if engine == "astrbot_tts":
+                    return await self._tts_astrbot(cleaned, norm_lang, astrbot_tts_callback)
+            except Exception as exc:
+                errors.append(f"{engine}: {redact_config_secrets(str(exc), config)}")
+
+        raise TranslationError("；".join(errors) if errors else "语音合成失败")
+
+    async def _tts_bing(
+        self,
+        text: str,
+        lang: str,
+        config: dict[str, Any],
+    ) -> SpeechResult:
+        voice_info = _BING_TTS_VOICES.get(lang)
+        if not voice_info:
+            raise TranslationError(f"Bing 语音暂不支持语种 {lang}")
+        xml_lang, gender, voice_name = voice_info
+        escaped = html.escape(text, quote=False)
+        ssml = (
+            f"<speak version='1.0' xml:lang='{xml_lang}'>"
+            f"<voice xml:lang='{xml_lang}' xml:gender='{gender}' name='{voice_name}'>"
+            f"{escaped}</voice></speak>"
+        )
+        session = await self._get_session()
+        last_exc: Exception | None = None
+        for attempt in range(2):
+            tok = await self._fetch_bing_token(
+                "https://cn.bing.com", config, force_refresh=(attempt > 0)
+            )
+            req_url = (
+                f"{tok['origin']}/tfettts?isVertical=1&IG={tok['ig']}"
+                f"&IID={tok['iid']}&SFX={tok['sfx']}"
+            )
+            headers = {
+                "User-Agent": DEFAULT_UA,
+                "Origin": tok["origin"],
+                "Referer": f"{tok['origin']}/translator",
+            }
+            form = {
+                "ssml": ssml,
+                "token": tok["token"],
+                "key": tok["key"],
+            }
+            try:
+                async with session.post(
+                    req_url,
+                    data=form,
+                    headers=headers,
+                    proxy=self._request_proxy(req_url, config),
+                    timeout=self._timeout(config),
+                ) as resp:
+                    audio_bytes, mime_type = await self._read_bytes_response(resp, "Bing 语音")
+                    return SpeechResult(
+                        audio_bytes=audio_bytes,
+                        mime_type=mime_type,
+                        lang=lang,
+                        source_name="Bing 微软语音",
+                    )
+            except Exception as exc:
+                last_exc = exc
+                if attempt == 0:
+                    continue
+        raise last_exc or TranslationError("Bing 语音请求失败")
+
+    async def _tts_youdao(
+        self,
+        text: str,
+        lang: str,
+        config: dict[str, Any],
+    ) -> SpeechResult:
+        params_base = _YOUDAO_TTS_LANG_MAP.get(lang)
+        if not params_base:
+            raise TranslationError(f"有道语音暂不支持语种 {lang}")
+        req_url = "https://dict.youdao.com/dictvoice"
+        params = {"audio": text, **params_base}
+        session = await self._get_session()
+        async with session.get(
+            req_url,
+            params=params,
+            headers={"User-Agent": DEFAULT_UA},
+            proxy=self._request_proxy(req_url, config),
+            timeout=self._timeout(config),
+        ) as resp:
+            audio_bytes, mime_type = await self._read_bytes_response(resp, "有道语音")
+            return SpeechResult(
+                audio_bytes=audio_bytes,
+                mime_type=mime_type,
+                lang=lang,
+                source_name="有道语音",
+            )
+
+    async def _tts_google(
+        self,
+        text: str,
+        lang: str,
+        config: dict[str, Any],
+    ) -> SpeechResult:
+        tl = _GOOGLE_TTS_LANG_MAP.get(lang, lang)
+        req_url = "https://translate.googleapis.com/translate_tts"
+        params = {
+            "ie": "UTF-8",
+            "client": "gtx",
+            "tl": tl,
+            "q": text,
+        }
+        session = await self._get_session()
+        async with session.get(
+            req_url,
+            params=params,
+            headers={"User-Agent": DEFAULT_UA},
+            proxy=self._request_proxy(req_url, config),
+            timeout=self._timeout(config),
+        ) as resp:
+            audio_bytes, mime_type = await self._read_bytes_response(resp, "Google 语音")
+            return SpeechResult(
+                audio_bytes=audio_bytes,
+                mime_type=mime_type,
+                lang=lang,
+                source_name="Google 语音",
+            )
+
+    async def _tts_astrbot(
+        self,
+        text: str,
+        lang: str,
+        astrbot_tts_callback: Callable[[str], Awaitable[SpeechResult | bytes | str]] | None,
+    ) -> SpeechResult:
+        if astrbot_tts_callback is None:
+            raise TranslationError("当前环境未配置 AstrBot 内置 TTS")
+        raw_res = await astrbot_tts_callback(text)
+        if isinstance(raw_res, SpeechResult):
+            return raw_res
+        if isinstance(raw_res, (bytes, bytearray)):
+            data = bytes(raw_res)
+            mime_type = self._validate_audio_bytes(data, "AstrBot 内置 TTS")
+            return SpeechResult(
+                audio_bytes=data,
+                mime_type=mime_type,
+                lang=lang,
+                source_name="AstrBot 内置 TTS",
+            )
+        if isinstance(raw_res, str) and raw_res.strip():
+            path = Path(raw_res.strip())
+            if not path.is_file():
+                raise TranslationError("AstrBot 内置 TTS 未生成有效音频文件")
+            data = await asyncio.to_thread(path.read_bytes)
+            mime_type = self._validate_audio_bytes(data, "AstrBot 内置 TTS")
+            return SpeechResult(
+                audio_bytes=data,
+                mime_type=mime_type,
+                lang=lang,
+                source_name="AstrBot 内置 TTS",
+            )
+        raise TranslationError("AstrBot 内置 TTS 返回空结果")
