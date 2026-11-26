@@ -539,6 +539,23 @@ class ParserAndHelperTests(unittest.TestCase):
         self.assertEqual("".join(chunks), "line1\n\nline2\nline3")
         self.assertTrue(all(len(c) <= 8 for c in chunks))
 
+        dict_prompt_plain = translator.build_llm_system_prompt(
+            "", "自动检测", "简体中文", dict_mode=True, use_markdown=False
+        )
+        self.assertIn("词典释义：", dict_prompt_plain)
+        self.assertIn("严禁出现 Primary translation", dict_prompt_plain)
+        self.assertIn("纯文本", dict_prompt_plain)
+
+        dict_prompt_md = translator.build_llm_system_prompt(
+            "", "自动检测", "简体中文", dict_mode=True, use_markdown=True
+        )
+        self.assertIn("Markdown", dict_prompt_md)
+
+        img_prompt = translator.build_llm_image_prompt(
+            source_lang="auto", target_lang="zh-CN", default_target="auto_zh_en", use_markdown=False
+        )
+        self.assertIn("中文标签", img_prompt)
+
 
 class ServiceAndPluginMockTests(unittest.IsolatedAsyncioTestCase):
     async def test_all_mocked_backends_and_dict_lookup(self):
@@ -735,7 +752,7 @@ class ServiceAndPluginMockTests(unittest.IsolatedAsyncioTestCase):
             if "open.bigmodel.cn" in url:
                 self.assertEqual(kw["json"]["model"], "GLM-4-Flash-250414")
                 sys_prompt = kw["json"]["messages"][0]["content"]
-                tag = "DICT" if "bilingual dictionary" in sys_prompt else "TEXT"
+                tag = "DICT" if "双语词典" in sys_prompt else "TEXT"
                 return MockResponse(200, {"choices": [{"message": {"content": f"{tag}:智谱译文"}}]})
             if "api.siliconflow.cn" in url:
                 self.assertEqual(kw["json"]["model"], "tencent/Hunyuan-MT-7B")
@@ -976,7 +993,7 @@ class ServiceAndPluginMockTests(unittest.IsolatedAsyncioTestCase):
                 return "prov-1"
 
             async def llm_generate(self, chat_provider_id, prompt, system_prompt):
-                mode = "DICT" if "bilingual dictionary" in system_prompt else "TEXT"
+                mode = "DICT" if "双语词典" in system_prompt else "TEXT"
                 return types.SimpleNamespace(
                     role="assistant",
                     completion_text=f"<think>plan</think>{mode}:{prompt}",

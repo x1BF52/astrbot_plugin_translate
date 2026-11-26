@@ -42,25 +42,22 @@ DEFAULT_LLM_TEXT_PROMPT = (
 )
 
 DEFAULT_LLM_DICT_PROMPT = (
-    "You are a concise bilingual dictionary and translator. The user provided a "
-    "word or short phrase to translate into {target_lang}. Output:\n"
-    "1. Primary translation and phonetic transcription / reading (if applicable).\n"
-    "2. Common meanings grouped by part of speech (e.g. n., v., adj., adv., prep.) "
-    "with multiple senses per part of speech.\n"
-    "3. 1-2 short collocations or brief bilingual examples if helpful.\n"
-    "If the input is a pure ASCII word/phrase without accents and source language "
-    "is auto-detected, treat it as English unless it is clearly a foreign greeting "
-    "or loanword (e.g. bonjour, gracias, danke).\n"
-    "Keep the output clean, well-structured, and free of filler."
+    "你是一位简洁专业的双语词典与翻译助手。用户提供了一个单词或短语，请将其翻译为 {target_lang}。\n"
+    "请严格遵守以下排版与语言规范：\n"
+    "1. 全文所有标题、标签和说明必须使用中文，严禁出现 Primary translation、Meanings、Examples、Usage 等英文标题。\n"
+    "2. 第 1 行：直接给出最核心、最自然的译文（不要给简体中文额外标注汉语拼音）。\n"
+    "3. 第 2 行：如有外语读音或音标，标注原词读音（如：发音：英 /.../  美 /.../，或日语假名/罗马音）；若无则省略。\n"
+    "4. 词性释义部分标题写「词典释义：」，同一词性的多个义项合并在同一行并用分号「；」隔开，切勿把词性缩写单独占一行（示例：• n. 释义1；释义2）。\n"
+    "5. 如有常见搭配或例句，标题写「常见搭配：」或「例句：」，仅保留 1-2 条实用短句（格式：• 原句 — 译文）。\n"
+    "6. 若输入为无重音符号的纯 ASCII 单词/短语且源语言为自动检测，默认按英语处理（明显的外来语问候词如 bonjour、gracias、danke 除外）。\n"
+    "7. 整体紧凑清晰、无多余空行，不要输出寒暄、免责声明或多余解释。"
 )
 
 DEFAULT_LLM_IMAGE_PROMPT = (
-    "You are a professional OCR and multimodal translator. Carefully read all visible "
-    "text in the provided image(s) (signs, menus, screenshots, labels, comics, documents, etc.) "
-    "and translate it accurately into {target_rule}.\n"
-    "If the user supplied additional instructions or context text alongside the image, follow them.\n"
-    "Keep the output concise and well-organized: include key extracted source text followed by "
-    "its natural translation, and do not invent unreadable text."
+    "你是一位专业的多模态 OCR 与翻译专家。请仔细识别图片中的所有可见文字（路牌、菜单、截图、标签、漫画、文档等），"
+    "并准确、自然地翻译为 {target_rule}。\n"
+    "若用户在发送图片时附带了额外要求或补充指令，请优先按其要求处理。\n"
+    "请保持输出简洁整齐、全部使用中文标签（例如「原文」「译文」，不要使用英文标题），不要编造无法辨认的文字。"
 )
 
 
@@ -78,9 +75,9 @@ def build_llm_system_prompt(
         tpl = cleaned_custom
     elif dict_mode:
         style = (
-            "Format clearly using concise Markdown (bold part-of-speech labels like **n.**, **v.**, bullet lists, and inline code for phonetics)."
+            "排版格式：使用简洁的 Markdown（标题或词性加粗如 **词典释义**、- **n.** 释义1；释义2，音标与原词例句用行内代码 `...` 包裹）。"
             if use_markdown
-            else "Use clean plain text with bullet prefix '• ' and NO Markdown syntax (no **, #, or backticks)."
+            else "排版格式：使用纯文本与圆点前缀「• 」，严禁使用任何 Markdown 语法（不要出现 **、# 或反引号 `）。"
         )
         tpl = f"{DEFAULT_LLM_DICT_PROMPT}\n{style}"
     else:
@@ -125,9 +122,9 @@ def build_llm_image_prompt(
         )
 
     style = (
-        "Format cleanly using concise Markdown (section headers/bold labels and bullet lists)."
+        "排版格式：使用简洁 Markdown（中文小标题或加粗标签与列表）。"
         if use_markdown
-        else "Format cleanly using plain text without Markdown syntax (no **, #, or backticks)."
+        else "排版格式：使用简洁纯文本，不要使用 Markdown 语法（不要出现 **、# 或反引号 `）。"
     )
     return DEFAULT_LLM_IMAGE_PROMPT.replace("{target_rule}", target_rule) + f"\n{style}"
 
