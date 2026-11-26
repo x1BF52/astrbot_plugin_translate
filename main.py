@@ -42,8 +42,8 @@ _CMD_PREFIX_PATTERN = re.compile(r"\s*\[MSG_ID:[^\]]+\]\s*$")
 _QQ_OFFICIAL_IMAGE_URL_PATTERN = re.compile(
     r"\[附件\d+\][^\n]*?类型:图片[^\n]*?URL:(https?://\S+)"
 )
-_DEFAULT_NORMAL_TRIGGERS = ("fy", "翻译")
-_DEFAULT_AI_TRIGGERS = ("fyai", "ai翻译")
+_DEFAULT_NORMAL_TRIGGERS = ("/fy", "/翻译")
+_DEFAULT_AI_TRIGGERS = ("/fyai", "/ai翻译")
 _ACTIVE_PLUGIN: "TranslatePlugin | None" = None
 
 _BaseCustomFilter = getattr(filter, "CustomFilter", object)
@@ -124,23 +124,41 @@ class TranslatePlugin(Star):
             pass
         return ["/"]
 
-    def _get_configured_triggers(self) -> tuple[list[str], list[str], bool]:
-        """Return (normal_triggers, ai_triggers, enable_default_fy)."""
+    def _get_configured_triggers(self) -> tuple[list[str], list[str]]:
+        """Return configured (normal_triggers, ai_triggers) using built-in defaults when unset."""
         wake_cfg = self.config.get("wake_settings") or {}
-        enable_default = bool(wake_cfg.get("enable_default_fy", True))
-        custom_normal = parse_trigger_list(wake_cfg.get("custom_wake_words"))
-        custom_ai = parse_trigger_list(wake_cfg.get("custom_ai_wake_words"))
+        has_legacy_flag = "enable_default_fy" in wake_cfg
+        legacy_enable = bool(wake_cfg.get("enable_default_fy", True))
 
-        normal: list[str] = list(_DEFAULT_NORMAL_TRIGGERS) if enable_default else []
-        for item in custom_normal:
-            if item not in normal:
-                normal.append(item)
+        if "custom_wake_words" in wake_cfg:
+            normal = parse_trigger_list(wake_cfg.get("custom_wake_words"))
+            if has_legacy_flag and legacy_enable:
+                for item in _DEFAULT_NORMAL_TRIGGERS:
+                    bare = item.lstrip("/")
+                    if item not in normal and bare not in normal:
+                        normal.append(item)
+        else:
+            normal = (
+                list(_DEFAULT_NORMAL_TRIGGERS)
+                if (not has_legacy_flag or legacy_enable)
+                else []
+            )
 
-        ai: list[str] = list(_DEFAULT_AI_TRIGGERS) if enable_default else []
-        for item in custom_ai:
-            if item not in ai:
-                ai.append(item)
-        return normal, ai, enable_default
+        if "custom_ai_wake_words" in wake_cfg:
+            ai = parse_trigger_list(wake_cfg.get("custom_ai_wake_words"))
+            if has_legacy_flag and legacy_enable:
+                for item in _DEFAULT_AI_TRIGGERS:
+                    bare = item.lstrip("/")
+                    if item not in ai and bare not in ai:
+                        ai.append(item)
+        else:
+            ai = (
+                list(_DEFAULT_AI_TRIGGERS)
+                if (not has_legacy_flag or legacy_enable)
+                else []
+            )
+
+        return normal, ai
 
     @staticmethod
     def _has_explicit_symbol(trigger: str) -> bool:
@@ -183,7 +201,7 @@ class TranslatePlugin(Star):
         except Exception:
             pass
 
-        normal_raw, ai_raw, _ = self._get_configured_triggers()
+        normal_raw, ai_raw = self._get_configured_triggers()
 
         def _bare_cmds(items: list[str]) -> list[str]:
             cmds: list[str] = []
@@ -279,7 +297,7 @@ class TranslatePlugin(Star):
         cfg: Any = None,
     ) -> tuple[bool, str] | None:
         """Check whether an incoming event matches custom wake words (returns (force_ai, trigger))."""
-        normal_triggers, ai_triggers, _ = self._get_configured_triggers()
+        normal_triggers, ai_triggers = self._get_configured_triggers()
         candidates: list[tuple[bool, str]] = [
             *((True, t) for t in ai_triggers),
             *((False, t) for t in normal_triggers),
@@ -325,7 +343,7 @@ class TranslatePlugin(Star):
     ) -> str:
         """Extract command argument tail while preserving original newlines."""
         raw_msg = self._get_raw_plain_text(event)
-        normal_triggers, ai_triggers, _ = self._get_configured_triggers()
+        normal_triggers, ai_triggers = self._get_configured_triggers()
         all_triggers = sorted(
             {*_DEFAULT_NORMAL_TRIGGERS, *_DEFAULT_AI_TRIGGERS, *normal_triggers, *ai_triggers},
             key=len,
@@ -798,42 +816,35 @@ class TranslatePlugin(Star):
         target_desc = (
             "智能中英互译" if default_target == "auto_zh_en" else get_lang_label(default_target)
         )
-        wake_cfg = self.config.get("wake_settings") or {}
-        custom_normal = parse_trigger_list(wake_cfg.get("custom_wake_words"))
-        custom_ai = parse_trigger_list(wake_cfg.get("custom_ai_wake_words"))
-        custom_line_md = (
-            f"- 自定义唤醒词：{'、'.join(f'`{w}`' for w in [*custom_normal, *custom_ai])}\n"
-            if (custom_normal or custom_ai)
-            else ""
-        )
-        custom_line_plain = (
-            f"• 自定义唤醒词：{'、'.join([*custom_normal, *custom_ai])}\n"
-            if (custom_normal or custom_ai)
-            else ""
-        )
+        normal_trigs, ai_trigs = self._get_configured_triggers()
+        ex_cmd = normal_trigs[0] if normal_trigs else (ai_trigs[0] if ai_trigs else "/fy")
         if self._use_markdown():
+            normal_disp = (
+                "、".join(f"`{w}`" for w in normal_trigs) if normal_trigs else "（已停用）"
+            )
+            ai_disp = "、".join(f"`{w}`" for w in ai_trigs) if ai_trigs else "（已停用）"
             return (
                 "**翻译插件使用说明**\n"
-                "- `/fy <文本>` 或 `/翻译 <文本>`（单词/短语自动附带词性与多义）\n"
-                "- `/fyai <文本>` 或 `/ai翻译 <文本>` 手动强制使用 AI 大模型翻译\n"
-                f"{custom_line_md}"
-                "- 发送图片或引用图片并发送 `/fy` / `/fyai`（可加目标语如 `/fy 日语`）自动识图翻译\n"
-                "- 附带发音：`/fy -v <文本>` 或 `/fy 日语 -v 你好`（也支持 `--voice` / `--tts`）\n"
-                "- 引用任意消息并发送 `/fy`、`/fyai` 或 `/翻译`（支持加目标语如 `/fy en`）\n"
-                "- 指定目标语：`/fy 日语 你好` | `/fy ->ja 你好` | `/fy en->zh Hello`\n"
-                "- 查看支持语种：`/fy --langs` | 查看配置状态：`/fy --status`\n\n"
+                f"- 普通翻译：{normal_disp} `<文本>`（单词/短语自动附带词性与多义）\n"
+                f"- AI 翻译：{ai_disp} `<文本>` 手动强制使用 AI 大模型翻译\n"
+                f"- 发送图片或引用图片并发送 `{ex_cmd}`（可加目标语如 `{ex_cmd} 日语`）自动识图翻译\n"
+                f"- 附带发音：`{ex_cmd} -v <文本>` 或 `{ex_cmd} 日语 -v 你好`（也支持 `--voice` / `--tts`）\n"
+                f"- 引用任意消息并发送 `{ex_cmd}`（支持加目标语如 `{ex_cmd} en`）\n"
+                f"- 指定目标语：`{ex_cmd} 日语 你好` | `{ex_cmd} ->ja 你好` | `{ex_cmd} en->zh Hello`\n"
+                f"- 查看支持语种：`{ex_cmd} --langs` | 查看配置状态：`{ex_cmd} --status`\n\n"
                 f"**默认目标**：{target_desc}"
             )
+        normal_disp_plain = "、".join(normal_trigs) if normal_trigs else "（已停用）"
+        ai_disp_plain = "、".join(ai_trigs) if ai_trigs else "（已停用）"
         return (
             "翻译插件使用说明：\n"
-            "• /fy <文本> 或 /翻译 <文本>（单词/短语自动附带词性与多义）\n"
-            "• /fyai <文本> 或 /ai翻译 <文本> 手动强制使用 AI 大模型翻译\n"
-            f"{custom_line_plain}"
-            "• 发送或引用图片并输入 /fy / /fyai（可加目标语如 /fy 日语）自动识图翻译\n"
-            "• 附带发音：/fy -v <文本> 或 /fy 日语 -v 你好（支持 --voice / --tts）\n"
-            "• 引用任意消息并发送 /fy、/fyai 或 /翻译（支持加目标语如 /fy en）\n"
-            "• 指定目标语：/fy 日语 你好  |  /fy ->ja 你好  |  /fy en->zh Hello\n"
-            "• 查看支持语种：/fy --langs  |  查看配置状态：/fy --status\n"
+            f"• 普通翻译：{normal_disp_plain} <文本>（单词/短语自动附带词性与多义）\n"
+            f"• AI 翻译：{ai_disp_plain} <文本> 手动强制使用 AI 大模型翻译\n"
+            f"• 发送或引用图片并输入 {ex_cmd}（可加目标语如 {ex_cmd} 日语）自动识图翻译\n"
+            f"• 附带发音：{ex_cmd} -v <文本> 或 {ex_cmd} 日语 -v 你好（支持 --voice / --tts）\n"
+            f"• 引用任意消息并发送 {ex_cmd}（支持加目标语如 {ex_cmd} en）\n"
+            f"• 指定目标语：{ex_cmd} 日语 你好  |  {ex_cmd} ->ja 你好  |  {ex_cmd} en->zh Hello\n"
+            f"• 查看支持语种：{ex_cmd} --langs  |  查看配置状态：{ex_cmd} --status\n"
             f"默认目标：{target_desc}"
         )
 
@@ -897,9 +908,9 @@ class TranslatePlugin(Star):
         )
         img_status = f"开启（{ai_prov_desc}）" if img_enabled else "已关闭"
 
-        normal_trigs, ai_trigs, _ = self._get_configured_triggers()
+        normal_trigs, ai_trigs = self._get_configured_triggers()
         wake_desc = (
-            f"普通 [{' / '.join(normal_trigs) or '无'}] | AI [{' / '.join(ai_trigs) or '无'}]"
+            f"普通 [{'、'.join(normal_trigs) or '无'}] | AI [{'、'.join(ai_trigs) or '无'}]"
         )
 
         voice_cfg = self.config.get("voice_settings") or {}

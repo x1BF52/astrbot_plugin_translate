@@ -1348,15 +1348,15 @@ def parse_trigger_list(raw: Any) -> list[str]:
 
 
 def resolve_ai_provider_choice(config: dict[str, Any]) -> str:
-    """Resolve user-selected or manually entered AI provider name/ID (blank = active default)."""
+    """Resolve user-selected AI provider ID (blank = active default)."""
     ai_cfg = config.get("ai_settings") or {}
     legacy_cfg = config.get("image_translation") or {}
-    manual = str(ai_cfg.get("ai_provider_manual") or "").strip()
-    if manual:
-        return manual
     selected = str(ai_cfg.get("ai_provider_id") or "").strip()
     if selected:
         return selected
+    manual = str(ai_cfg.get("ai_provider_manual") or "").strip()
+    if manual:
+        return manual
     return str(legacy_cfg.get("image_astrbot_provider_id") or "").strip()
 
 

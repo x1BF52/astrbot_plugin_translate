@@ -304,17 +304,11 @@
     "collapsed": false,
     "items": {
       "ai_provider_id": {
-        "description": "选择 AI 提供商（留空为当前提供商）",
+        "description": "AI 提供商（留空为当前提供商）",
         "type": "string",
         "default": "",
         "_special": "select_provider",
-        "hint": "从 AstrBot 已配置的对话模型提供商中选择；留空则自动使用当前会话正在使用的默认提供商（用于 /fyai 手动 AI 翻译与图片翻译）。"
-      },
-      "ai_provider_manual": {
-        "description": "手动输入 AI 提供商名 / ID（可选）",
-        "type": "string",
-        "default": "",
-        "hint": "需要手动指定时可直接填写 AstrBot 提供商 ID、名称或模型名（优先于上方下拉选择）；同时留空则使用当前提供商。填写 openai_compat 可直接使用插件内配置的 OpenAI 兼容接口。"
+        "hint": "选择用于 /fyai 手动 AI 翻译与图片翻译的 AstrBot 模型提供商（支持在下拉框内搜索或直接编辑）；留空则自动使用当前会话的默认提供商。"
       },
       "enable_image_translation": {
         "description": "收到图片或引用图片时自动调用 AI 识别并翻译",
@@ -331,27 +325,27 @@
     }
   },
   "wake_settings": {
-    "description": "自定义唤醒词 / 触发指令设置",
+    "description": "唤醒词 / 触发指令设置",
     "type": "object",
     "collapsed": false,
     "items": {
-      "enable_default_fy": {
-        "description": "启用默认唤醒词（/fy、/翻译、/fyai、/ai翻译）",
-        "type": "bool",
-        "default": true,
-        "hint": "开启时保留默认的 /fy、/翻译 与 /fyai、/ai翻译；关闭后仅响应下方添加的自定义唤醒词。"
-      },
       "custom_wake_words": {
-        "description": "自定义普通翻译唤醒词（等效于 /fy）",
+        "description": "普通翻译唤醒词（走主翻译接口）",
         "type": "list",
-        "default": [],
-        "hint": "点击添加唤醒词，例如 /tl、tr、!tl、翻译：等；可带 / 或自定义符号前缀，保存后立即生效。"
+        "default": [
+          "/fy",
+          "/翻译"
+        ],
+        "hint": "内置默认 /fy、/翻译，可自由增删或修改（例如 /tl、tr、!tl、翻译：等）；清空列表则停用普通翻译唤醒词，保存后立即生效。"
       },
       "custom_ai_wake_words": {
-        "description": "自定义 AI 翻译唤醒词（等效于 /fyai）",
+        "description": "AI 翻译唤醒词（强制调用 AI 提供商）",
         "type": "list",
-        "default": [],
-        "hint": "点击添加 AI 翻译唤醒词，例如 /aitl、/ai、!fyai 等；触发后会强制调用 AI 提供商进行翻译。"
+        "default": [
+          "/fyai",
+          "/ai翻译"
+        ],
+        "hint": "内置默认 /fyai、/ai翻译，可自由增删或修改（例如 /aitl、/ai、!fyai 等）；清空列表则停用 AI 翻译唤醒词，触发后会强制调用 AI 提供商进行翻译。"
       }
     }
   },
