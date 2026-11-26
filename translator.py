@@ -407,7 +407,7 @@ _YOUDAO_ZH_PREFIX = {
 class ParsedCommand:
     """Result of parsing a /fy or /翻译 command invocation."""
 
-    action: str  # "translate" | "help" | "status"
+    action: str  # "translate" | "help" | "status" | "langs"
     source_lang: str = "auto"
     target_lang: str | None = None
     text: str = ""
@@ -492,6 +492,8 @@ def parse_command_args(raw_body: str, has_reply: bool = False) -> ParsedCommand:
         return ParsedCommand(action="help")
     if lower in {"--status", "--apis", "--engines"}:
         return ParsedCommand(action="status")
+    if lower in {"--langs", "--languages", "--lang"}:
+        return ParsedCommand(action="langs")
 
     # 1. Explicit -t <lang> / --to <lang> / --to=<lang>
     flag_match = re.match(
@@ -565,20 +567,21 @@ def parse_command_args(raw_body: str, has_reply: bool = False) -> ParsedCommand:
 
 def chunk_text(text: str, max_chars: int) -> list[str]:
     """Split long text into chunks not exceeding max_chars, preserving line breaks."""
-    if len(text) <= max_chars:
+    limit = max(1, int(max_chars))
+    if len(text) <= limit:
         return [text]
 
     chunks: list[str] = []
     current = ""
     for line in text.splitlines(keepends=True):
-        if len(line) > max_chars:
+        if len(line) > limit:
             if current:
                 chunks.append(current)
                 current = ""
-            for i in range(0, len(line), max_chars):
-                chunks.append(line[i : i + max_chars])
+            for i in range(0, len(line), limit):
+                chunks.append(line[i : i + limit])
             continue
-        if len(current) + len(line) > max_chars:
+        if len(current) + len(line) > limit:
             chunks.append(current)
             current = line
         else:
@@ -612,6 +615,15 @@ def extract_json_path(payload: Any, path: str) -> Any:
 
 
 _TEMPLATE_VAR_PATTERN = re.compile(r"\{\{([A-Za-z0-9_]+)\}\}")
+_THINK_BLOCK_PATTERN = re.compile(r"<think>[\s\S]*?</think>\s*", re.IGNORECASE)
+
+
+def clean_llm_translation(text: str) -> str:
+    """Strip reasoning <think> blocks from LLM translation outputs."""
+    if not text:
+        return ""
+    cleaned = _THINK_BLOCK_PATTERN.sub("", text).strip()
+    return cleaned or text.strip()
 
 
 def redact_secret(message: str, secret: str | None) -> str:
@@ -690,6 +702,59 @@ class TranslationService:
         except (TypeError, ValueError):
             val = 15
         return aiohttp.ClientTimeout(total=val)
+
+    async def _read_json_response(
+        self,
+        resp: Any,
+        provider_name: str,
+        *,
+        allow_error_json: bool = False,
+    ) -> Any:
+        raw = await resp.text(errors="ignore")
+        if resp.status not in range(200, 300):
+            if allow_error_json:
+                try:
+                    err_data = json.loads(raw)
+                except json.JSONDecodeError:
+                    err_data = None
+                if isinstance(err_data, dict):
+                    raw_err = err_data.get("error")
+                    detail = (
+                        raw_err.get("message")
+                        if isinstance(raw_err, dict)
+                        else (raw_err or err_data.get("message"))
+                    )
+                    if detail:
+                        raise TranslationError(f"HTTP {resp.status}: {detail}")
+            detail_tail = f": {raw[:180].strip()}" if allow_error_json and raw.strip() else ""
+            raise TranslationError(f"HTTP {resp.status}{detail_tail}")
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise TranslationError(f"{provider_name} 返回了非 JSON 响应") from exc
+
+    async def _translate_chunked(
+        self,
+        text: str,
+        max_chars: int,
+        translate_chunk: Callable[[str], Awaitable[tuple[str, str]]],
+    ) -> tuple[str, str]:
+        parts: list[str] = []
+        detected_lang = ""
+        for chunk in chunk_text(text, max_chars):
+            core = chunk.strip()
+            if not core:
+                parts.append(chunk)
+                continue
+            lead_len = len(chunk) - len(chunk.lstrip())
+            trail_len = len(chunk) - len(chunk.rstrip())
+            lead_ws = chunk[:lead_len]
+            trail_ws = chunk[len(chunk) - trail_len :] if trail_len else ""
+            translated_core, det = await translate_chunk(core)
+            parts.append(f"{lead_ws}{translated_core.strip()}{trail_ws}")
+            if det and not detected_lang:
+                detected_lang = det
+        return "".join(parts), detected_lang
 
     async def translate(
         self,
@@ -824,7 +889,11 @@ class TranslationService:
                 if resp.status != 200:
                     raise TranslationError(f"获取 Bing 会话令牌失败 (HTTP {resp.status})")
                 body = await resp.text(errors="ignore")
-                final_origin = f"{resp.url.scheme}://{resp.url.host}"
+                parsed_final = urllib.parse.urlparse(str(resp.url))
+                if parsed_final.scheme and parsed_final.netloc:
+                    final_origin = f"{parsed_final.scheme}://{parsed_final.netloc}"
+                else:
+                    final_origin = f"{resp.url.scheme}://{resp.url.host}"
 
             helper = re.search(
                 r"params_AbusePreventionHelper\s*=\s*\[(\d+)\s*,\s*['\"]([^'\"]+)['\"]",
@@ -862,24 +931,20 @@ class TranslationService:
         tgt = _map_lang(target_lang, _BING_LANG_MAP)
 
         session = await self._get_session()
-        parts: list[str] = []
-        detected_lang = ""
-
-        for part in chunk_text(text, 900):
-            translated_part, det = await self._bing_single_request(
+        explicit_ep = url if parsed.path.endswith("ttranslatev3") else ""
+        return await self._translate_chunked(
+            text,
+            900,
+            lambda part: self._bing_single_request(
                 session=session,
                 base_origin=base_origin,
-                explicit_endpoint=url if parsed.path.endswith("ttranslatev3") else "",
+                explicit_endpoint=explicit_ep,
                 text=part,
                 src=src,
                 tgt=tgt,
                 config=config,
-            )
-            parts.append(translated_part)
-            if det and not detected_lang:
-                detected_lang = det
-
-        return "".join(parts), detected_lang
+            ),
+        )
 
     async def _bing_single_request(
         self,
@@ -989,30 +1054,34 @@ class TranslationService:
             "User-Agent": DEFAULT_UA,
             "Referer": url,
         }
-        async with session.post(
-            url,
-            data={"inputtext": text, "type": youdao_type},
-            headers=headers,
-            proxy=self._request_proxy(url, config),
-            timeout=self._timeout(config),
-        ) as resp:
-            if resp.status != 200:
-                raise TranslationError(f"HTTP {resp.status}")
-            body = await resp.text(errors="ignore")
 
-        ul_match = re.search(
-            r'<ul[^>]*id=["\']translateResult["\'][^>]*>(.*?)</ul>',
-            body,
-            flags=re.S | re.I,
-        )
-        if not ul_match:
-            raise TranslationError("未解析到有道翻译结果")
-        items = re.findall(r"<li[^>]*>(.*?)</li>", ul_match.group(1), flags=re.S | re.I)
-        lines = [html.unescape(re.sub(r"<[^>]+>", "", item)).strip() for item in items]
-        result = "\n".join(line for line in lines if line)
-        if not result:
-            raise TranslationError("有道翻译结果为空")
-        return result, actual_src if source_lang == "auto" else ""
+        async def _send_youdao(chunk: str) -> tuple[str, str]:
+            async with session.post(
+                url,
+                data={"inputtext": chunk, "type": youdao_type},
+                headers=headers,
+                proxy=self._request_proxy(url, config),
+                timeout=self._timeout(config),
+            ) as resp:
+                if resp.status != 200:
+                    raise TranslationError(f"HTTP {resp.status}")
+                body = await resp.text(errors="ignore")
+
+            ul_match = re.search(
+                r'<ul[^>]*id=["\']translateResult["\'][^>]*>(.*?)</ul>',
+                body,
+                flags=re.S | re.I,
+            )
+            if not ul_match:
+                raise TranslationError("未解析到有道翻译结果")
+            items = re.findall(r"<li[^>]*>(.*?)</li>", ul_match.group(1), flags=re.S | re.I)
+            lines = [html.unescape(re.sub(r"<[^>]+>", "", item)).strip() for item in items]
+            result = "\n".join(line for line in lines if line)
+            if not result:
+                raise TranslationError("有道翻译结果为空")
+            return result, actual_src if source_lang == "auto" else ""
+
+        return await self._translate_chunked(text, 900, _send_youdao)
 
     async def _translate_mymemory(
         self,
@@ -1030,9 +1099,8 @@ class TranslationService:
         adv = config.get("advanced") or {}
         email = str(adv.get("mymemory_email") or "").strip()
         session = await self._get_session()
-        parts: list[str] = []
 
-        for chunk in chunk_text(text, 450):
+        async def _send_mymemory(chunk: str) -> tuple[str, str]:
             params: dict[str, str] = {
                 "q": chunk,
                 "langpair": f"{actual_src}|{target_lang}",
@@ -1048,18 +1116,16 @@ class TranslationService:
             ) as resp:
                 if resp.status == 429:
                     raise TranslationError("MyMemory 触发速率限制 (429)")
-                if resp.status != 200:
-                    raise TranslationError(f"HTTP {resp.status}")
-                data = await resp.json(content_type=None)
+                data = await self._read_json_response(resp, "MyMemory")
 
             status = data.get("responseStatus")
             if status != 200:
                 detail = data.get("responseDetails") or f"status={status}"
                 raise TranslationError(f"MyMemory 错误: {detail}")
             translated = (data.get("responseData") or {}).get("translatedText", "")
-            parts.append(html.unescape(translated))
+            return html.unescape(translated), actual_src if source_lang == "auto" else ""
 
-        return "".join(parts), actual_src if source_lang == "auto" else ""
+        return await self._translate_chunked(text, 450, _send_mymemory)
 
     async def _translate_google_gtx(
         self,
@@ -1071,9 +1137,8 @@ class TranslationService:
         **_: Any,
     ) -> tuple[str, str]:
         session = await self._get_session()
-        parts: list[str] = []
-        detected = ""
-        for chunk in chunk_text(text, 900):
+
+        async def _send_gtx(chunk: str) -> tuple[str, str]:
             params = {
                 "client": "gtx",
                 "sl": source_lang,
@@ -1088,18 +1153,17 @@ class TranslationService:
                 proxy=self._request_proxy(url, config),
                 timeout=self._timeout(config),
             ) as resp:
-                if resp.status != 200:
-                    raise TranslationError(f"HTTP {resp.status}")
-                data = await resp.json(content_type=None)
+                data = await self._read_json_response(resp, "Google GTX")
 
             if not isinstance(data, list) or not data or not isinstance(data[0], list):
                 raise TranslationError("Google GTX 返回结构异常")
-            parts.append(
-                "".join(str(seg[0]) for seg in data[0] if isinstance(seg, list) and seg and seg[0])
+            translated = "".join(
+                str(seg[0]) for seg in data[0] if isinstance(seg, list) and seg and seg[0]
             )
-            if not detected and len(data) > 2 and isinstance(data[2], str):
-                detected = str(data[2])
-        return "".join(parts), detected
+            detected = str(data[2]) if len(data) > 2 and isinstance(data[2], str) else ""
+            return translated, detected
+
+        return await self._translate_chunked(text, 900, _send_gtx)
 
     async def _translate_google_clients5(
         self,
@@ -1111,9 +1175,8 @@ class TranslationService:
         **_: Any,
     ) -> tuple[str, str]:
         session = await self._get_session()
-        parts: list[str] = []
-        detected = ""
-        for chunk in chunk_text(text, 900):
+
+        async def _send_c5(chunk: str) -> tuple[str, str]:
             params = {
                 "client": "dict-chrome-ex",
                 "sl": source_lang,
@@ -1128,28 +1191,25 @@ class TranslationService:
                 proxy=self._request_proxy(url, config),
                 timeout=self._timeout(config),
             ) as resp:
-                if resp.status != 200:
-                    raise TranslationError(f"HTTP {resp.status}")
-                data = await resp.json(content_type=None)
+                data = await self._read_json_response(resp, "Google Clients5")
 
             if isinstance(data, list) and data:
                 if isinstance(data[0], list):
                     seg_texts: list[str] = []
+                    detected = ""
                     for item in data:
                         if isinstance(item, list) and item:
                             seg_texts.append(str(item[0]))
                             if not detected and len(item) > 1 and isinstance(item[1], str):
                                 detected = item[1]
-                    parts.append("".join(seg_texts))
-                    continue
+                    return "".join(seg_texts), detected
                 if isinstance(data[0], str):
-                    parts.append("".join(str(x) for x in data))
-                    continue
+                    return "".join(str(x) for x in data), ""
             if isinstance(data, dict) and "sentences" in data:
-                parts.append("".join(s.get("trans", "") for s in data["sentences"]))
-                continue
+                return "".join(s.get("trans", "") for s in data["sentences"]), ""
             raise TranslationError("Google Clients5 返回结构异常")
-        return "".join(parts), detected
+
+        return await self._translate_chunked(text, 900, _send_c5)
 
     async def _translate_mozhi(
         self,
@@ -1175,29 +1235,33 @@ class TranslationService:
             if engine == "google"
             else _MOZHI_LANG_MAP
         )
-        params = {
-            "engine": engine,
-            "from": _map_lang(source_lang, lang_map),
-            "to": _map_lang(target_lang, lang_map),
-            "text": text,
-        }
         session = await self._get_session()
-        async with session.get(
-            req_url,
-            params=params,
-            headers={"User-Agent": DEFAULT_UA, "Accept": "application/json"},
-            proxy=self._request_proxy(req_url, config),
-            timeout=self._timeout(config),
-        ) as resp:
-            if resp.status != 200:
-                raise TranslationError(f"HTTP {resp.status}")
-            data = await resp.json(content_type=None)
 
-        translated = str(data.get("translated-text") or "")
-        detected = str(data.get("detected") or "")
-        if not translated:
-            raise TranslationError("Mozhi 未返回译文")
-        return translated, detected
+        async def _send_mozhi(chunk: str) -> tuple[str, str]:
+            params = {
+                "engine": engine,
+                "from": _map_lang(source_lang, lang_map),
+                "to": _map_lang(target_lang, lang_map),
+                "text": chunk,
+            }
+            async with session.get(
+                req_url,
+                params=params,
+                headers={"User-Agent": DEFAULT_UA, "Accept": "application/json"},
+                proxy=self._request_proxy(req_url, config),
+                timeout=self._timeout(config),
+            ) as resp:
+                data = await self._read_json_response(
+                    resp, "Mozhi", allow_error_json=True
+                )
+
+            translated = str(data.get("translated-text") or "")
+            detected = str(data.get("detected") or "")
+            if not translated:
+                raise TranslationError("Mozhi 未返回译文")
+            return translated, detected
+
+        return await self._translate_chunked(text, 800, _send_mozhi)
 
     async def _translate_lingva(
         self,
@@ -1216,9 +1280,7 @@ class TranslationService:
         tgt = _map_lang(target_lang, _LINGVA_LANG_MAP)
         session = await self._get_session()
 
-        parts: list[str] = []
-        detected_lang = ""
-        for chunk in chunk_text(text, 1000):
+        async def _send_lingva(chunk: str) -> tuple[str, str]:
             encoded = urllib.parse.quote(chunk, safe="")
             req_url = f"{base}/{src}/{tgt}/{encoded}"
             async with session.get(
@@ -1227,18 +1289,17 @@ class TranslationService:
                 proxy=self._request_proxy(req_url, config),
                 timeout=self._timeout(config),
             ) as resp:
-                if resp.status != 200:
-                    raise TranslationError(f"HTTP {resp.status}")
-                data = await resp.json(content_type=None)
+                data = await self._read_json_response(
+                    resp, "Lingva", allow_error_json=True
+                )
 
             if data.get("error"):
                 raise TranslationError(str(data["error"]))
-            parts.append(str(data.get("translation") or ""))
             info = data.get("info") or {}
-            if not detected_lang and isinstance(info, dict):
-                detected_lang = str(info.get("detectedSource") or "")
+            detected = str(info.get("detectedSource") or "") if isinstance(info, dict) else ""
+            return str(data.get("translation") or ""), detected
 
-        return "".join(parts), detected_lang
+        return await self._translate_chunked(text, 1000, _send_lingva)
 
     async def _translate_libretranslate(
         self,
@@ -1271,10 +1332,9 @@ class TranslationService:
             proxy=self._request_proxy(req_url, config),
             timeout=self._timeout(config),
         ) as resp:
-            data = await resp.json(content_type=None)
-            if resp.status != 200:
-                err_msg = data.get("error") if isinstance(data, dict) else f"HTTP {resp.status}"
-                raise TranslationError(str(err_msg or f"HTTP {resp.status}"))
+            data = await self._read_json_response(
+                resp, "LibreTranslate", allow_error_json=True
+            )
 
         translated = str(data.get("translatedText") or "")
         detected = str((data.get("detectedLanguage") or {}).get("language") or "")
@@ -1318,9 +1378,7 @@ class TranslationService:
             proxy=self._request_proxy(req_url, config),
             timeout=self._timeout(config),
         ) as resp:
-            if resp.status != 200:
-                raise TranslationError(f"HTTP {resp.status}")
-            data = await resp.json(content_type=None)
+            data = await self._read_json_response(resp, "DeepLX", allow_error_json=True)
 
         if data.get("code") not in (None, 200):
             raise TranslationError(str(data.get("message") or f"code={data.get('code')}"))
@@ -1373,10 +1431,9 @@ class TranslationService:
             proxy=self._request_proxy(req_url, config),
             timeout=self._timeout(config),
         ) as resp:
-            raw = await resp.text(errors="ignore")
-            if resp.status != 200:
-                raise TranslationError(f"HTTP {resp.status}: {raw[:180]}")
-            data = json.loads(raw)
+            data = await self._read_json_response(
+                resp, "OpenAI 兼容接口", allow_error_json=True
+            )
 
         content = extract_json_path(data, "choices.0.message.content")
         if isinstance(content, list):
@@ -1387,7 +1444,7 @@ class TranslationService:
             )
         if not isinstance(content, str) or not content.strip():
             raise TranslationError("OpenAI 兼容接口未返回有效译文")
-        return content, ""
+        return clean_llm_translation(content), ""
 
     async def _translate_custom_http(
         self,

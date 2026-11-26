@@ -14,10 +14,12 @@ from astrbot.core.star.filter.command import GreedyStr
 
 from .translator import (
     DEFAULT_LLM_PROMPT,
+    LANG_LABELS,
     PROVIDER_PRESETS,
     TranslationError,
     TranslationResult,
     TranslationService,
+    clean_llm_translation,
     get_lang_label,
     parse_command_args,
     redact_secret,
@@ -234,7 +236,7 @@ class TranslatePlugin(Star):
         result_text = str(result_text).strip()
         if getattr(llm_resp, "role", None) == "err":
             raise TranslationError(result_text or "AstrBot 内置 LLM 调用失败")
-        return result_text
+        return clean_llm_translation(result_text)
 
     def _build_help_text(self) -> str:
         primary_key = str(self.config.get("api_provider") or "bing_cn")
@@ -248,8 +250,20 @@ class TranslatePlugin(Star):
             "• /fy <文本> 或 /翻译 <文本>\n"
             "• 引用任意消息并发送 /fy 或 /翻译（支持加目标语如 /fy en）\n"
             "• 指定目标语：/fy 日语 你好  |  /fy ->ja 你好  |  /fy en->zh Hello\n"
-            "• 查看当前配置与支持接口：/fy --status\n"
+            "• 查看支持语种：/fy --langs  |  查看配置状态：/fy --status\n"
             f"当前引擎：{preset.name} | 默认目标：{target_desc}"
+        )
+
+    def _build_langs_text(self) -> str:
+        pairs = [
+            f"{label} ({code})"
+            for code, label in LANG_LABELS.items()
+            if code != "auto"
+        ]
+        return (
+            "支持的目标语种代码与名称：\n"
+            + "、".join(pairs)
+            + "\n用法示例：/fy 日语 你好  |  /fy ->zh-TW 你好  |  /fy en->fr Hello"
         )
 
     def _build_status_text(self) -> str:
@@ -260,6 +274,10 @@ class TranslatePlugin(Star):
             active_url = "AstrBot 当前内置大模型"
         else:
             active_url = custom_url or preset.default_url or "未配置"
+        default_target = str(self.config.get("default_target_lang") or "auto_zh_en")
+        target_desc = (
+            "智能中英互译" if default_target == "auto_zh_en" else get_lang_label(default_target)
+        )
         fallbacks = [
             PROVIDER_PRESETS[k].name
             for k in (self.config.get("fallback_providers") or [])
@@ -275,6 +293,7 @@ class TranslatePlugin(Star):
             "当前翻译配置状态：\n"
             f"• 主接口：{preset.name}\n"
             f"• 接口地址：{active_url}\n"
+            f"• 默认目标：{target_desc}\n"
             f"• 备用回退：{fallback_line}\n"
             f"• 代理模式：{proxy}\n"
             "可在 AstrBot 管理面板「插件管理 -> 多引擎翻译插件 -> 配置」中切换预设免费 API 或填写自定义接口。"
@@ -316,6 +335,9 @@ class TranslatePlugin(Star):
             return
         if parsed.action == "status":
             yield event.plain_result(self._build_status_text())
+            return
+        if parsed.action == "langs":
+            yield event.plain_result(self._build_langs_text())
             return
 
         content = parsed.text
