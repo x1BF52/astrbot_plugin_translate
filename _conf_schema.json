@@ -298,38 +298,29 @@
     },
     "hint": "使用点号和下标访问 JSON 字段，例如 translatedText、data.text 或 translations.0.text。"
   },
-  "image_translation": {
-    "description": "图片翻译设置（视觉大模型）",
+  "ai_settings": {
+    "description": "AI 翻译与识图设置（/fyai & 图片翻译）",
     "type": "object",
-    "collapsed": true,
+    "collapsed": false,
     "items": {
-      "enable_image_translation": {
-        "description": "收到图片或引用图片时自动调用大模型识别并翻译",
-        "type": "bool",
-        "default": true,
-        "hint": "发送图片并附带 /fy（或引用含图消息发送 /fy）时，自动调用多模态大模型识别图内文字并翻译。"
-      },
-      "image_llm_source": {
-        "description": "图片识别大模型来源",
-        "type": "string",
-        "default": "auto",
-        "options": [
-          "auto",
-          "astrbot_llm",
-          "openai_compat"
-        ],
-        "labels": [
-          "自动选择（主接口为 OpenAI 兼容时优先使用，否则使用 AstrBot 内置大模型）",
-          "始终使用 AstrBot 当前内置大模型",
-          "始终使用插件配置的 OpenAI 兼容接口"
-        ],
-        "hint": "无论主翻译接口是否选择免费网页 API（如 Bing），收到图片时都会使用此处指定的视觉模型。"
-      },
-      "image_astrbot_provider_id": {
-        "description": "指定 AstrBot 视觉模型 Provider ID（可选）",
+      "ai_provider_id": {
+        "description": "选择 AI 提供商（留空为当前提供商）",
         "type": "string",
         "default": "",
-        "hint": "留空则自动使用 AstrBot 当前会话的默认对话大模型；如果主模型不支持识图，可在此填写 AstrBot 中已配置的视觉模型 ID。"
+        "_special": "select_provider",
+        "hint": "从 AstrBot 已配置的对话模型提供商中选择；留空则自动使用当前会话正在使用的默认提供商（用于 /fyai 手动 AI 翻译与图片翻译）。"
+      },
+      "ai_provider_manual": {
+        "description": "手动输入 AI 提供商名 / ID（可选）",
+        "type": "string",
+        "default": "",
+        "hint": "需要手动指定时可直接填写 AstrBot 提供商 ID、名称或模型名（优先于上方下拉选择）；同时留空则使用当前提供商。填写 openai_compat 可直接使用插件内配置的 OpenAI 兼容接口。"
+      },
+      "enable_image_translation": {
+        "description": "收到图片或引用图片时自动调用 AI 识别并翻译",
+        "type": "bool",
+        "default": true,
+        "hint": "发送图片并附带 /fy、/fyai（或引用含图消息）时，自动调用上方配置的多模态 AI 识别图内文字并翻译。"
       },
       "image_system_prompt": {
         "description": "图片翻译自定义系统提示词（可选）",
@@ -339,8 +330,33 @@
       }
     }
   },
+  "wake_settings": {
+    "description": "自定义唤醒词 / 触发指令设置",
+    "type": "object",
+    "collapsed": false,
+    "items": {
+      "enable_default_fy": {
+        "description": "启用默认唤醒词（/fy、/翻译、/fyai、/ai翻译）",
+        "type": "bool",
+        "default": true,
+        "hint": "开启时保留默认的 /fy、/翻译 与 /fyai、/ai翻译；关闭后仅响应下方添加的自定义唤醒词。"
+      },
+      "custom_wake_words": {
+        "description": "自定义普通翻译唤醒词（等效于 /fy）",
+        "type": "list",
+        "default": [],
+        "hint": "点击添加唤醒词，例如 /tl、tr、!tl、翻译：等；可带 / 或自定义符号前缀，保存后立即生效。"
+      },
+      "custom_ai_wake_words": {
+        "description": "自定义 AI 翻译唤醒词（等效于 /fyai）",
+        "type": "list",
+        "default": [],
+        "hint": "点击添加 AI 翻译唤醒词，例如 /aitl、/ai、!fyai 等；触发后会强制调用 AI 提供商进行翻译。"
+      }
+    }
+  },
   "voice_settings": {
-    "description": "语音发音设置（TTS）",
+    "description": "语音发音设置（云端 TTS）",
     "type": "object",
     "collapsed": true,
     "items": {
@@ -348,7 +364,7 @@
         "description": "允许使用 -v / --voice / --tts / --say 触发语音发音",
         "type": "bool",
         "default": true,
-        "hint": "发送 /fy -v apple 或 /fy 日语 -v 你好 可在返回译文后附带外语发音语音（需平台支持且建议系统已安装 ffmpeg）。"
+        "hint": "使用云端 TTS（Bing / 有道 / Google）直接生成语音。注：AstrBot 发送语音消息（Record）内部需调用 ffmpeg 将云端 MP3 转为 WAV/SILK；若环境未装 ffmpeg，会自动降级发送 MP3 音频文件。"
       },
       "auto_voice_for_words": {
         "description": "单词/短语翻译自动附带发音语音",
@@ -357,7 +373,7 @@
         "hint": "开启后，查询单词或短语时无需加 -v 也会自动发送语音发音；默认关闭以免群聊刷屏。"
       },
       "tts_provider": {
-        "description": "发音语音合成引擎",
+        "description": "云端发音引擎",
         "type": "string",
         "default": "auto",
         "options": [
@@ -368,13 +384,13 @@
           "astrbot_tts"
         ],
         "labels": [
-          "自动选择（Bing 微软神经语音优先，自动回退有道/Google/内置 TTS）",
-          "Bing 微软神经网络语音（免密国内直连，支持 60+ 语种）",
-          "有道词典语音（免密国内直连，英/日/韩/法/德/西/俄/中）",
-          "Google 翻译语音（海外直连或配合代理使用）",
+          "自动选择（Bing 微软云端神经语音优先，自动回退有道/Google/内置 TTS）",
+          "Bing 微软云端神经网络语音（免密国内直连，支持 60+ 语种）",
+          "有道词典云端语音（免密国内直连，英/日/韩/法/德/西/俄/中）",
+          "Google 云端翻译语音（海外直连或配合代理使用）",
           "AstrBot 当前内置 TTS 提供商"
         ],
-        "hint": "默认免密直连 Bing 微软神经网络发音，失败时自动回退其他可用接口。"
+        "hint": "默认调用 Bing / 有道 / Google 云端语音接口直接合成，无需本地语音模型；部分内置 TTS（输出 WAV 格式）无需 ffmpeg 即可直接发语音条。"
       },
       "voice_target_mode": {
         "description": "发音内容选择策略",

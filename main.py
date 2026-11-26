@@ -32,7 +32,9 @@ from .translator import (
     get_lang_label,
     is_word_or_phrase,
     parse_command_args,
+    parse_trigger_list,
     redact_config_secrets,
+    resolve_ai_provider_choice,
     select_speech_target,
 )
 
@@ -40,23 +42,61 @@ _CMD_PREFIX_PATTERN = re.compile(r"\s*\[MSG_ID:[^\]]+\]\s*$")
 _QQ_OFFICIAL_IMAGE_URL_PATTERN = re.compile(
     r"\[附件\d+\][^\n]*?类型:图片[^\n]*?URL:(https?://\S+)"
 )
+_DEFAULT_NORMAL_TRIGGERS = ("fy", "翻译")
+_DEFAULT_AI_TRIGGERS = ("fyai", "ai翻译")
+_ACTIVE_PLUGIN: "TranslatePlugin | None" = None
+
+_BaseCustomFilter = getattr(filter, "CustomFilter", object)
+
+
+def _custom_filter_decorator(filter_cls):
+    deco = getattr(filter, "custom_filter", None)
+    if callable(deco):
+        return deco(filter_cls)
+    return lambda fn: fn
+
+
+class _DynamicWakeFilter(_BaseCustomFilter):
+    """Match user-configured custom wake words without duplicating default @filter.command hits."""
+
+    def filter(self, event: AstrMessageEvent, cfg: Any) -> bool:
+        plugin = _ACTIVE_PLUGIN
+        if plugin is None:
+            return False
+        if plugin._matches_registered_command(event, cfg):
+            return False
+        matched = plugin._match_custom_wake_trigger(event, cfg)
+        if not matched:
+            return False
+        if hasattr(event, "set_extra"):
+            event.set_extra("_translate_custom_trigger", matched)
+        return True
 
 
 class TranslatePlugin(Star):
-    """AstrBot 翻译插件：支持 /fy 与 /翻译，内置常见免费 API 选项与自动回退。"""
+    """AstrBot 翻译插件：支持 /fy、/翻译、/fyai 与自定义唤醒词，内置常见免费 API 与多模态/语音能力。"""
 
     def __init__(self, context: Context, config: AstrBotConfig | dict | None = None):
+        global _ACTIVE_PLUGIN
         super().__init__(context)
         self.config: dict[str, Any] = config if config is not None else {}
         self._session: aiohttp.ClientSession | None = None
         self._service = TranslationService(self._get_session)
+        _ACTIVE_PLUGIN = self
+        self._sync_command_filters()
 
     async def initialize(self) -> None:
-        """Initialize shared HTTP client session on plugin load."""
+        """Initialize shared HTTP client session and sync custom command aliases on load."""
+        global _ACTIVE_PLUGIN
+        _ACTIVE_PLUGIN = self
         await self._get_session()
+        self._sync_command_filters()
 
     async def terminate(self) -> None:
         """Close shared HTTP client session when plugin unloads or reloads."""
+        global _ACTIVE_PLUGIN
+        if _ACTIVE_PLUGIN is self:
+            _ACTIVE_PLUGIN = None
         if self._session and not self._session.closed:
             await self._session.close()
         self._session = None
@@ -67,23 +107,162 @@ class TranslatePlugin(Star):
             self._session = aiohttp.ClientSession(trust_env=True)
         return self._session
 
-    def _get_wake_prefixes(self, event: AstrMessageEvent) -> list[str]:
+    def _get_wake_prefixes(
+        self,
+        event: AstrMessageEvent,
+        cfg: Any = None,
+    ) -> list[str]:
         """Fetch configured wake prefixes for the current session."""
         try:
-            cfg = self.context.get_config(umo=event.unified_msg_origin)
-            prefixes = cfg.get("wake_prefix", ["/"]) if isinstance(cfg, dict) else ["/"]
+            eff_cfg = cfg if isinstance(cfg, dict) else self.context.get_config(
+                umo=event.unified_msg_origin
+            )
+            prefixes = eff_cfg.get("wake_prefix", ["/"]) if isinstance(eff_cfg, dict) else ["/"]
             if isinstance(prefixes, list) and prefixes:
                 return [str(p) for p in prefixes if isinstance(p, str)]
         except Exception:
             pass
         return ["/"]
 
-    def _extract_raw_command_body(
-        self,
-        event: AstrMessageEvent,
-        greedy_fallback: str,
-    ) -> str:
-        """Extract command argument tail while preserving original newlines."""
+    def _get_configured_triggers(self) -> tuple[list[str], list[str], bool]:
+        """Return (normal_triggers, ai_triggers, enable_default_fy)."""
+        wake_cfg = self.config.get("wake_settings") or {}
+        enable_default = bool(wake_cfg.get("enable_default_fy", True))
+        custom_normal = parse_trigger_list(wake_cfg.get("custom_wake_words"))
+        custom_ai = parse_trigger_list(wake_cfg.get("custom_ai_wake_words"))
+
+        normal: list[str] = list(_DEFAULT_NORMAL_TRIGGERS) if enable_default else []
+        for item in custom_normal:
+            if item not in normal:
+                normal.append(item)
+
+        ai: list[str] = list(_DEFAULT_AI_TRIGGERS) if enable_default else []
+        for item in custom_ai:
+            if item not in ai:
+                ai.append(item)
+        return normal, ai, enable_default
+
+    @staticmethod
+    def _has_explicit_symbol(trigger: str) -> bool:
+        if not trigger:
+            return False
+        first = trigger[0]
+        last = trigger[-1]
+        return (not first.isalnum() and first not in {"_"}) or last in {":", "："}
+
+    @staticmethod
+    def _strip_leading_wake_prefix(trigger: str, prefixes: list[str]) -> str | None:
+        """Convert '/tl' -> 'tl' if it starts with an active AstrBot wake_prefix."""
+        candidates = sorted(
+            {p for p in prefixes if p},
+            key=len,
+            reverse=True,
+        )
+        stripped = trigger.strip()
+        for prefix in candidates:
+            if stripped.startswith(prefix):
+                rest = stripped[len(prefix) :].strip()
+                return rest or None
+        if not TranslatePlugin._has_explicit_symbol(stripped):
+            return stripped
+        return None
+
+    def _sync_command_filters(self) -> None:
+        """Synchronize configured custom command words onto AstrBot CommandFilter descriptors."""
+        try:
+            from astrbot.core.star.filter.command import CommandFilter
+            from astrbot.core.star.star_handler import star_handlers_registry
+        except Exception:
+            return
+
+        prefixes: list[str] = ["/"]
+        try:
+            cfg = self.context.get_config()
+            if isinstance(cfg, dict) and isinstance(cfg.get("wake_prefix"), list):
+                prefixes = [str(p) for p in cfg["wake_prefix"] if isinstance(p, str)] or ["/"]
+        except Exception:
+            pass
+
+        normal_raw, ai_raw, _ = self._get_configured_triggers()
+
+        def _bare_cmds(items: list[str]) -> list[str]:
+            cmds: list[str] = []
+            for item in items:
+                bare = self._strip_leading_wake_prefix(item, prefixes)
+                if bare and not any(ch.isspace() for ch in bare) and bare not in cmds:
+                    cmds.append(bare)
+            return cmds
+
+        target_map = {
+            "translate_command": _bare_cmds(normal_raw),
+            "translate_ai_command": _bare_cmds(ai_raw),
+        }
+
+        for handler in star_handlers_registry:
+            if getattr(handler, "handler_module_path", None) != self.__module__:
+                continue
+            h_name = getattr(handler, "handler_name", "")
+            if h_name not in target_map:
+                continue
+            cmds = target_map[h_name]
+            for f in getattr(handler, "event_filters", []) or []:
+                if isinstance(f, CommandFilter):
+                    if not cmds:
+                        handler.enabled = False
+                    else:
+                        handler.enabled = True
+                        f.command_name = cmds[0]
+                        f.alias = set(cmds[1:])
+                        f._cmpl_cmd_names = None
+
+    def _matches_registered_command(self, event: AstrMessageEvent, cfg: Any = None) -> bool:
+        """Return True if our CommandFilter handlers already match this event."""
+        if not getattr(event, "is_at_or_wake_command", False):
+            return False
+        try:
+            from astrbot.core.star.filter.command import CommandFilter
+            from astrbot.core.star.star_handler import star_handlers_registry
+        except Exception:
+            return False
+
+        msg_str = re.sub(r"\s+", " ", (event.get_message_str() or "").strip())
+        if not msg_str:
+            return False
+        for handler in star_handlers_registry:
+            if getattr(handler, "handler_module_path", None) != self.__module__:
+                continue
+            if not getattr(handler, "enabled", True):
+                continue
+            if getattr(handler, "handler_name", "") not in {
+                "translate_command",
+                "translate_ai_command",
+            }:
+                continue
+            for f in getattr(handler, "event_filters", []) or []:
+                if isinstance(f, CommandFilter):
+                    if not f.custom_filter_ok(event, cfg):
+                        continue
+                    for full_cmd in f.get_complete_command_names():
+                        if msg_str == full_cmd or msg_str.startswith(f"{full_cmd} "):
+                            return True
+        return False
+
+    @staticmethod
+    def _match_trigger_prefix(text: str, trigger: str) -> bool:
+        if not text or not trigger:
+            return False
+        if len(text) < len(trigger):
+            return False
+        if not text[: len(trigger)].lower() == trigger.lower():
+            return False
+        rest = text[len(trigger) :]
+        if not rest:
+            return True
+        if trigger[-1] in {":", "："}:
+            return True
+        return rest[0].isspace()
+
+    def _get_raw_plain_text(self, event: AstrMessageEvent) -> str:
         plain_parts: list[str] = []
         try:
             for seg in event.get_messages():
@@ -91,20 +270,83 @@ class TranslatePlugin(Star):
                     plain_parts.append(seg.text)
         except Exception:
             pass
-
         raw_msg = "".join(plain_parts) if plain_parts else (event.get_message_str() or "")
-        raw_msg = _CMD_PREFIX_PATTERN.sub("", raw_msg).lstrip()
+        return _CMD_PREFIX_PATTERN.sub("", raw_msg).lstrip()
 
+    def _match_custom_wake_trigger(
+        self,
+        event: AstrMessageEvent,
+        cfg: Any = None,
+    ) -> tuple[bool, str] | None:
+        """Check whether an incoming event matches custom wake words (returns (force_ai, trigger))."""
+        normal_triggers, ai_triggers, _ = self._get_configured_triggers()
+        candidates: list[tuple[bool, str]] = [
+            *((True, t) for t in ai_triggers),
+            *((False, t) for t in normal_triggers),
+        ]
+        candidates.sort(key=lambda item: len(item[1]), reverse=True)
+        if not candidates:
+            return None
+
+        raw_plain = self._get_raw_plain_text(event)
+        msg_str = (event.get_message_str() or "").strip()
+        consumed_prefix = (
+            event.get_extra("_consumed_wake_prefix", "")
+            if hasattr(event, "get_extra")
+            else ""
+        ) or ""
+        reconstructed = f"{consumed_prefix}{msg_str}" if consumed_prefix and msg_str else msg_str
+        is_wake_cmd = bool(getattr(event, "is_at_or_wake_command", False))
+        prefixes = self._get_wake_prefixes(event, cfg)
+
+        for force_ai, trig in candidates:
+            if self._has_explicit_symbol(trig):
+                if self._match_trigger_prefix(raw_plain, trig) or self._match_trigger_prefix(
+                    reconstructed, trig
+                ):
+                    return force_ai, trig
+            elif is_wake_cmd:
+                # Stripped command string (already had wake_prefix removed by AstrBot)
+                if self._match_trigger_prefix(msg_str, trig):
+                    return force_ai, trig
+                # Raw message with wake_prefix intact
+                for prefix in sorted(prefixes, key=len, reverse=True):
+                    if prefix and raw_plain.startswith(prefix):
+                        tail = raw_plain[len(prefix) :].lstrip()
+                        if self._match_trigger_prefix(tail, trig):
+                            return force_ai, trig
+                        break
+        return None
+
+    def _extract_raw_command_body(
+        self,
+        event: AstrMessageEvent,
+        greedy_fallback: str,
+    ) -> str:
+        """Extract command argument tail while preserving original newlines."""
+        raw_msg = self._get_raw_plain_text(event)
+        normal_triggers, ai_triggers, _ = self._get_configured_triggers()
+        all_triggers = sorted(
+            {*_DEFAULT_NORMAL_TRIGGERS, *_DEFAULT_AI_TRIGGERS, *normal_triggers, *ai_triggers},
+            key=len,
+            reverse=True,
+        )
+
+        for trig in all_triggers:
+            if self._has_explicit_symbol(trig) and self._match_trigger_prefix(raw_msg, trig):
+                return raw_msg[len(trig) :].strip()
+
+        stripped_msg = raw_msg
         for prefix in sorted(self._get_wake_prefixes(event), key=len, reverse=True):
-            if prefix and raw_msg.startswith(prefix):
-                raw_msg = raw_msg[len(prefix) :].lstrip()
+            if prefix and stripped_msg.startswith(prefix):
+                stripped_msg = stripped_msg[len(prefix) :].lstrip()
                 break
 
-        cmd_match = re.match(r"^(?:fy|翻译)(?:$|([\s\S]*))$", raw_msg, flags=re.IGNORECASE)
-        if cmd_match:
-            tail = cmd_match.group(1) or ""
-            if not tail or tail[0].isspace():
-                return tail.strip()
+        for trig in all_triggers:
+            if not self._has_explicit_symbol(trig) and self._match_trigger_prefix(
+                stripped_msg, trig
+            ):
+                return stripped_msg[len(trig) :].strip()
 
         return _CMD_PREFIX_PATTERN.sub("", str(greedy_fallback or "")).strip()
 
@@ -317,6 +559,54 @@ class TranslatePlugin(Star):
             res.use_markdown(self._use_markdown())
         return res
 
+    def _resolve_astrbot_provider_id(
+        self,
+        provider_id_override: str = "",
+    ) -> str:
+        """Resolve configured/manual AstrBot provider ID or name (blank = active default)."""
+        raw = (provider_id_override or resolve_ai_provider_choice(self.config)).strip()
+        if not raw or raw.lower() in {"openai_compat", "openai"}:
+            return ""
+        providers = []
+        if hasattr(self.context, "get_all_providers"):
+            try:
+                providers = self.context.get_all_providers() or []
+            except Exception:
+                providers = []
+
+        raw_lower = raw.lower()
+        for exact in (True, False):
+            for prov in providers:
+                canonical_id = ""
+                candidates: list[str] = []
+                try:
+                    meta = prov.meta() if hasattr(prov, "meta") else None
+                    if meta and getattr(meta, "id", None):
+                        canonical_id = str(meta.id)
+                        candidates.append(canonical_id)
+                except Exception:
+                    pass
+                pcfg = getattr(prov, "provider_config", None)
+                if isinstance(pcfg, dict):
+                    for key in ("id", "provider_source_id", "name"):
+                        val = pcfg.get(key)
+                        if val:
+                            sval = str(val)
+                            if not canonical_id and key == "id":
+                                canonical_id = sval
+                            candidates.append(sval)
+                if hasattr(prov, "get_model"):
+                    try:
+                        model_name = prov.get_model()
+                        if model_name:
+                            candidates.append(str(model_name))
+                    except Exception:
+                        pass
+                for cand in candidates:
+                    if (cand == raw) if exact else (cand.lower() == raw_lower):
+                        return canonical_id or candidates[0]
+        return raw
+
     async def _invoke_astrbot_llm(
         self,
         event: AstrMessageEvent,
@@ -327,11 +617,12 @@ class TranslatePlugin(Star):
         provider_id_override: str = "",
     ) -> str:
         """Invoke AstrBot's configured LLM provider (text or multimodal)."""
+        resolved_override = self._resolve_astrbot_provider_id(provider_id_override)
         llm_resp = None
         if hasattr(self.context, "get_current_chat_provider_id") and hasattr(
             self.context, "llm_generate"
         ):
-            provider_id = provider_id_override.strip()
+            provider_id = resolved_override
             if not provider_id:
                 try:
                     provider_id = await self.context.get_current_chat_provider_id(
@@ -352,12 +643,8 @@ class TranslatePlugin(Star):
         else:
             provider = None
             try:
-                if provider_id_override.strip() and hasattr(
-                    self.context, "get_provider_by_id"
-                ):
-                    prov_res = self.context.get_provider_by_id(
-                        provider_id_override.strip()
-                    )
+                if resolved_override and hasattr(self.context, "get_provider_by_id"):
+                    prov_res = self.context.get_provider_by_id(resolved_override)
                     provider = (
                         await prov_res
                         if inspect.isawaitable(prov_res)
@@ -511,13 +798,28 @@ class TranslatePlugin(Star):
         target_desc = (
             "智能中英互译" if default_target == "auto_zh_en" else get_lang_label(default_target)
         )
+        wake_cfg = self.config.get("wake_settings") or {}
+        custom_normal = parse_trigger_list(wake_cfg.get("custom_wake_words"))
+        custom_ai = parse_trigger_list(wake_cfg.get("custom_ai_wake_words"))
+        custom_line_md = (
+            f"- 自定义唤醒词：{'、'.join(f'`{w}`' for w in [*custom_normal, *custom_ai])}\n"
+            if (custom_normal or custom_ai)
+            else ""
+        )
+        custom_line_plain = (
+            f"• 自定义唤醒词：{'、'.join([*custom_normal, *custom_ai])}\n"
+            if (custom_normal or custom_ai)
+            else ""
+        )
         if self._use_markdown():
             return (
                 "**翻译插件使用说明**\n"
                 "- `/fy <文本>` 或 `/翻译 <文本>`（单词/短语自动附带词性与多义）\n"
-                "- 发送图片或引用图片并发送 `/fy`（可加目标语如 `/fy 日语`）自动识图翻译\n"
+                "- `/fyai <文本>` 或 `/ai翻译 <文本>` 手动强制使用 AI 大模型翻译\n"
+                f"{custom_line_md}"
+                "- 发送图片或引用图片并发送 `/fy` / `/fyai`（可加目标语如 `/fy 日语`）自动识图翻译\n"
                 "- 附带发音：`/fy -v <文本>` 或 `/fy 日语 -v 你好`（也支持 `--voice` / `--tts`）\n"
-                "- 引用任意消息并发送 `/fy` 或 `/翻译`（支持加目标语如 `/fy en`）\n"
+                "- 引用任意消息并发送 `/fy`、`/fyai` 或 `/翻译`（支持加目标语如 `/fy en`）\n"
                 "- 指定目标语：`/fy 日语 你好` | `/fy ->ja 你好` | `/fy en->zh Hello`\n"
                 "- 查看支持语种：`/fy --langs` | 查看配置状态：`/fy --status`\n\n"
                 f"**默认目标**：{target_desc}"
@@ -525,9 +827,11 @@ class TranslatePlugin(Star):
         return (
             "翻译插件使用说明：\n"
             "• /fy <文本> 或 /翻译 <文本>（单词/短语自动附带词性与多义）\n"
-            "• 发送或引用图片并输入 /fy（可加目标语如 /fy 日语）自动识图翻译\n"
+            "• /fyai <文本> 或 /ai翻译 <文本> 手动强制使用 AI 大模型翻译\n"
+            f"{custom_line_plain}"
+            "• 发送或引用图片并输入 /fy / /fyai（可加目标语如 /fy 日语）自动识图翻译\n"
             "• 附带发音：/fy -v <文本> 或 /fy 日语 -v 你好（支持 --voice / --tts）\n"
-            "• 引用任意消息并发送 /fy 或 /翻译（支持加目标语如 /fy en）\n"
+            "• 引用任意消息并发送 /fy、/fyai 或 /翻译（支持加目标语如 /fy en）\n"
             "• 指定目标语：/fy 日语 你好  |  /fy ->ja 你好  |  /fy en->zh Hello\n"
             "• 查看支持语种：/fy --langs  |  查看配置状态：/fy --status\n"
             f"默认目标：{target_desc}"
@@ -581,16 +885,21 @@ class TranslatePlugin(Star):
         output_fmt = "Markdown" if self._use_markdown() else "纯文本"
         proxy = "已配置" if str(self.config.get("proxy_url") or "").strip() else "直连"
 
-        img_cfg = self.config.get("image_translation") or {}
-        img_enabled = bool(img_cfg.get("enable_image_translation", True))
-        img_source = str(img_cfg.get("image_llm_source") or "auto")
-        img_labels = {
-            "auto": "自动选择",
-            "astrbot_llm": "AstrBot 内置大模型",
-            "openai_compat": "OpenAI 兼容接口",
-        }
-        img_status = (
-            f"开启（{img_labels.get(img_source, img_source)}）" if img_enabled else "已关闭"
+        ai_cfg = self.config.get("ai_settings") or {}
+        legacy_img = self.config.get("image_translation") or {}
+        ai_choice = resolve_ai_provider_choice(self.config)
+        ai_prov_desc = ai_choice if ai_choice else "当前会话默认提供商"
+        img_enabled = bool(
+            ai_cfg.get(
+                "enable_image_translation",
+                legacy_img.get("enable_image_translation", True),
+            )
+        )
+        img_status = f"开启（{ai_prov_desc}）" if img_enabled else "已关闭"
+
+        normal_trigs, ai_trigs, _ = self._get_configured_triggers()
+        wake_desc = (
+            f"普通 [{' / '.join(normal_trigs) or '无'}] | AI [{' / '.join(ai_trigs) or '无'}]"
         )
 
         voice_cfg = self.config.get("voice_settings") or {}
@@ -612,6 +921,8 @@ class TranslatePlugin(Star):
                 "**当前翻译配置状态**\n"
                 f"- **主接口**：{preset.name}\n"
                 f"- **接口地址**：`{active_url}`\n"
+                f"- **AI 提供商（/fyai & 识图）**：`{ai_prov_desc}`\n"
+                f"- **唤醒指令**：{wake_desc}\n"
                 f"- **默认目标**：{target_desc}\n"
                 f"- **图片翻译**：{img_status}\n"
                 f"- **语音发音**：{voice_status}\n"
@@ -624,6 +935,8 @@ class TranslatePlugin(Star):
             "当前翻译配置状态：\n"
             f"• 主接口：{preset.name}\n"
             f"• 接口地址：{active_url}\n"
+            f"• AI 提供商（/fyai & 识图）：{ai_prov_desc}\n"
+            f"• 唤醒指令：{wake_desc}\n"
             f"• 默认目标：{target_desc}\n"
             f"• 图片翻译：{img_status}\n"
             f"• 语音发音：{voice_status}\n"
@@ -723,12 +1036,17 @@ class TranslatePlugin(Star):
                 return self._make_result(event, f"语音生成失败：{safe_msg}")
             return None
 
-    @filter.command("fy", alias={"翻译"})
-    async def translate_command(self, event: AstrMessageEvent, text: GreedyStr):
-        """翻译文本、图片或引用的消息，支持 /fy 与 /翻译（附带 -v 可发音）。"""
+    async def _execute_translate(
+        self,
+        event: AstrMessageEvent,
+        raw_text: str,
+        *,
+        force_ai: bool = False,
+    ):
+        """Shared execution path for /fy, /fyai, and custom wake-word triggers."""
         has_reply = self._has_reply_segment(event)
         direct_images = await self._extract_message_images(event)
-        raw_body = self._extract_raw_command_body(event, str(text or ""))
+        raw_body = self._extract_raw_command_body(event, raw_text)
         parsed = parse_command_args(
             raw_body,
             has_reply=has_reply,
@@ -775,7 +1093,7 @@ class TranslatePlugin(Star):
             )
             return
 
-        op_label = "图片翻译" if images else "翻译"
+        op_label = "图片翻译" if images else ("AI 翻译" if force_ai else "翻译")
         try:
             if images:
                 async def image_llm_cb(
@@ -801,6 +1119,15 @@ class TranslatePlugin(Star):
                     astrbot_image_callback=image_llm_cb,
                 )
             else:
+                provider_override: str | None = None
+                if force_ai:
+                    ai_choice = resolve_ai_provider_choice(self.config)
+                    provider_override = (
+                        "openai_compat"
+                        if ai_choice.lower() in {"openai_compat", "openai"}
+                        else "astrbot_llm"
+                    )
+
                 async def llm_cb(
                     txt: str,
                     src_lbl: str,
@@ -811,13 +1138,34 @@ class TranslatePlugin(Star):
                         event, txt, src_lbl, tgt_lbl, dict_mode=dict_mode
                     )
 
-                result = await self._service.translate(
-                    text=content,
-                    config=self.config,
-                    source_lang=parsed.source_lang,
-                    target_lang=parsed.target_lang,
-                    llm_callback=llm_cb,
-                )
+                try:
+                    result = await self._service.translate(
+                        text=content,
+                        config=self.config,
+                        source_lang=parsed.source_lang,
+                        target_lang=parsed.target_lang,
+                        llm_callback=llm_cb,
+                        provider_override=provider_override,
+                    )
+                except TranslationError as ai_exc:
+                    plugin_llm_key = str(self.config.get("api_provider") or "")
+                    if (
+                        force_ai
+                        and provider_override == "astrbot_llm"
+                        and not resolve_ai_provider_choice(self.config)
+                        and plugin_llm_key in {"openai_compat", "zhipu_free", "siliconflow_free", "groq_free"}
+                        and "未配置可用的大模型提供商" in str(ai_exc)
+                    ):
+                        result = await self._service.translate(
+                            text=content,
+                            config=self.config,
+                            source_lang=parsed.source_lang,
+                            target_lang=parsed.target_lang,
+                            llm_callback=llm_cb,
+                            provider_override=plugin_llm_key,
+                        )
+                    else:
+                        raise
         except TranslationError as exc:
             safe_msg = redact_config_secrets(str(exc), self.config)
             logger.warning("%s失败: %s", op_label, safe_msg)
@@ -840,3 +1188,27 @@ class TranslatePlugin(Star):
         )
         if voice_result is not None:
             yield voice_result
+
+    @filter.command("fy", alias={"翻译"})
+    async def translate_command(self, event: AstrMessageEvent, text: GreedyStr):
+        """翻译文本、图片或引用的消息，支持 /fy 与 /翻译（附带 -v 可发音）。"""
+        async for res in self._execute_translate(event, str(text or ""), force_ai=False):
+            yield res
+
+    @filter.command("fyai", alias={"ai翻译"})
+    async def translate_ai_command(self, event: AstrMessageEvent, text: GreedyStr):
+        """手动指定使用 AI 大模型进行翻译，支持 /fyai 与 /ai翻译。"""
+        async for res in self._execute_translate(event, str(text or ""), force_ai=True):
+            yield res
+
+    @_custom_filter_decorator(_DynamicWakeFilter)
+    async def custom_wake_translate(self, event: AstrMessageEvent):
+        """响应用户在配置中动态添加的自定义唤醒词（如 /tl、!tl 等）。"""
+        extra = (
+            event.get_extra("_translate_custom_trigger")
+            if hasattr(event, "get_extra")
+            else None
+        )
+        force_ai = bool(extra[0]) if isinstance(extra, tuple) and extra else False
+        async for res in self._execute_translate(event, "", force_ai=force_ai):
+            yield res

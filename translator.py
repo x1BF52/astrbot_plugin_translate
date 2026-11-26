@@ -1331,6 +1331,35 @@ def _image_ref_to_openai_url_sync(ref: str) -> str:
     raise TranslationError(f"无法读取本地图片文件: {val[:80]}")
 
 
+def parse_trigger_list(raw: Any) -> list[str]:
+    """Normalize a list or delimited string of custom wake words."""
+    if isinstance(raw, str):
+        items = re.split(r"[\s,，;；]+", raw.strip())
+    elif isinstance(raw, (list, tuple, set)):
+        items = [str(x).strip() for x in raw if x is not None]
+    else:
+        return []
+    out: list[str] = []
+    for item in items:
+        s = item.strip()
+        if s and s not in out:
+            out.append(s)
+    return out
+
+
+def resolve_ai_provider_choice(config: dict[str, Any]) -> str:
+    """Resolve user-selected or manually entered AI provider name/ID (blank = active default)."""
+    ai_cfg = config.get("ai_settings") or {}
+    legacy_cfg = config.get("image_translation") or {}
+    manual = str(ai_cfg.get("ai_provider_manual") or "").strip()
+    if manual:
+        return manual
+    selected = str(ai_cfg.get("ai_provider_id") or "").strip()
+    if selected:
+        return selected
+    return str(legacy_cfg.get("image_astrbot_provider_id") or "").strip()
+
+
 class TranslationService:
     """Async multi-engine translation dispatcher with fallback and token caching."""
 
@@ -1414,6 +1443,7 @@ class TranslationService:
         source_lang: str = "auto",
         target_lang: str | None = None,
         llm_callback: Callable[..., Awaitable[str]] | None = None,
+        provider_override: str | None = None,
     ) -> TranslationResult:
         """Translate text via configured primary API with optional auto fallback."""
         default_target = str(config.get("default_target_lang") or "auto_zh_en")
@@ -1426,11 +1456,14 @@ class TranslationService:
         adv = config.get("advanced") or {}
         dict_mode = bool(adv.get("enable_dict_lookup", True)) and is_word_or_phrase(text)
 
-        chain = [primary]
-        if config.get("enable_auto_fallback", True):
-            for fb in config.get("fallback_providers") or []:
-                if isinstance(fb, str) and fb in PROVIDER_PRESETS and fb not in chain:
-                    chain.append(fb)
+        if provider_override and provider_override in PROVIDER_PRESETS:
+            chain = [provider_override]
+        else:
+            chain = [primary]
+            if config.get("enable_auto_fallback", True):
+                for fb in config.get("fallback_providers") or []:
+                    if isinstance(fb, str) and fb in PROVIDER_PRESETS and fb not in chain:
+                        chain.append(fb)
 
         errors: list[str] = []
         for idx, provider_key in enumerate(chain):
@@ -2905,14 +2938,23 @@ class TranslationService:
         if not image_urls:
             raise TranslationError("未检测到可识别的图片")
 
-        img_cfg = config.get("image_translation") or {}
-        if not bool(img_cfg.get("enable_image_translation", True)):
+        ai_cfg = config.get("ai_settings") or {}
+        legacy_cfg = config.get("image_translation") or {}
+        enable_img = ai_cfg.get(
+            "enable_image_translation",
+            legacy_cfg.get("enable_image_translation", True),
+        )
+        if not bool(enable_img):
             raise TranslationError("图片翻译功能已在配置中关闭")
 
         adv = config.get("advanced") or {}
         use_markdown = bool(adv.get("output_markdown", False))
         default_target = str(config.get("default_target_lang") or "auto_zh_en")
-        custom_prompt = str(img_cfg.get("image_system_prompt") or "").strip()
+        custom_prompt = str(
+            ai_cfg.get("image_system_prompt")
+            or legacy_cfg.get("image_system_prompt")
+            or ""
+        ).strip()
         system_prompt = build_llm_image_prompt(
             source_lang=source_lang,
             target_lang=target_lang,
@@ -2934,9 +2976,11 @@ class TranslationService:
             )
         )
 
-        llm_source = str(img_cfg.get("image_llm_source") or "auto").strip()
+        ai_choice = resolve_ai_provider_choice(config)
+        legacy_source = str(legacy_cfg.get("image_llm_source") or "auto").strip()
         primary = str(config.get("api_provider") or "bing_cn")
-        provider_id_override = str(img_cfg.get("image_astrbot_provider_id") or "").strip()
+        explicit_openai = ai_choice.lower() in {"openai_compat", "openai"}
+        provider_id_override = "" if explicit_openai else ai_choice
 
         async def _via_astrbot() -> tuple[str, str, str]:
             if astrbot_image_callback is None:
@@ -2961,8 +3005,12 @@ class TranslationService:
             )
             return out, "openai_compat", "OpenAI 兼容接口 (视觉)"
 
-        try_openai_first = llm_source == "openai_compat" or (
-            llm_source == "auto" and primary == "openai_compat"
+        try_openai_first = explicit_openai or (
+            not ai_choice
+            and (
+                legacy_source == "openai_compat"
+                or (legacy_source == "auto" and primary == "openai_compat")
+            )
         )
         if try_openai_first:
             try:
@@ -2976,7 +3024,7 @@ class TranslationService:
                     detected_lang="image",
                 )
             except Exception as first_exc:
-                if llm_source == "auto" and astrbot_image_callback is not None:
+                if not explicit_openai and legacy_source == "auto" and astrbot_image_callback is not None:
                     try:
                         translated, pkey, pname = await _via_astrbot()
                         return TranslationResult(

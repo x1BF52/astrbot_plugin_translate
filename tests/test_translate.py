@@ -123,18 +123,29 @@ def _ensure_stubs():
             messages=None,
             bot=None,
             umo: str = "umo:test",
+            is_at_or_wake_command: bool = False,
         ):
             self._msg_str = msg_str
             self._messages = messages or []
             self.bot = bot
             self.unified_msg_origin = umo
+            self.is_at_or_wake_command = is_at_or_wake_command
             self._temporary_local_files = []
+            self._extras = {}
 
         def get_message_str(self):
             return self._msg_str
 
         def get_messages(self):
             return self._messages
+
+        def set_extra(self, key, value):
+            self._extras[key] = value
+
+        def get_extra(self, key=None, default=None):
+            if key is None:
+                return self._extras
+            return self._extras.get(key, default)
 
         def plain_result(self, text: str):
             return text
@@ -145,11 +156,27 @@ def _ensure_stubs():
         def track_temporary_local_file(self, path: str):
             self._temporary_local_files.append(path)
 
+    class CustomFilter:
+        def __init__(self, raise_error: bool = True, **kwargs):
+            self.raise_error = raise_error
+
+    _CustomFilterCls = CustomFilter
+
     class _Filter:
+        CustomFilter = _CustomFilterCls
+
         @staticmethod
         def command(name, alias=None):
             def decorator(fn):
                 fn._command_meta = (name, alias or set())
+                return fn
+
+            return decorator
+
+        @staticmethod
+        def custom_filter(cls, *args, **kwargs):
+            def decorator(fn):
+                fn._custom_filter = cls
                 return fn
 
             return decorator
@@ -303,10 +330,18 @@ class MetadataAndSchemaTests(unittest.TestCase):
         self.assertIs(adv_items["enable_dict_lookup"]["default"], True)
         self.assertIs(adv_items["output_markdown"]["default"], False)
 
-        # Image translation and voice pronunciation defaults
-        img_items = schema["image_translation"]["items"]
-        self.assertIs(img_items["enable_image_translation"]["default"], True)
-        self.assertEqual(img_items["image_llm_source"]["default"], "auto")
+        # AI settings, wake settings, and voice pronunciation defaults
+        ai_items = schema["ai_settings"]["items"]
+        self.assertEqual(ai_items["ai_provider_id"]["default"], "")
+        self.assertEqual(ai_items["ai_provider_id"].get("_special"), "select_provider")
+        self.assertEqual(ai_items["ai_provider_manual"]["default"], "")
+        self.assertIs(ai_items["enable_image_translation"]["default"], True)
+
+        wake_items = schema["wake_settings"]["items"]
+        self.assertIs(wake_items["enable_default_fy"]["default"], True)
+        self.assertEqual(wake_items["custom_wake_words"]["default"], [])
+        self.assertEqual(wake_items["custom_ai_wake_words"]["default"], [])
+
         voice_items = schema["voice_settings"]["items"]
         self.assertIs(voice_items["enable_voice"]["default"], True)
         self.assertIs(voice_items["auto_voice_for_words"]["default"], False)
@@ -330,6 +365,8 @@ class MetadataAndSchemaTests(unittest.TestCase):
     def test_command_signature_eval_str(self):
         sig = inspect.signature(plugin_main.TranslatePlugin.translate_command, eval_str=True)
         self.assertIs(sig.parameters["text"].annotation, GreedyStr)
+        sig_ai = inspect.signature(plugin_main.TranslatePlugin.translate_ai_command, eval_str=True)
+        self.assertIs(sig_ai.parameters["text"].annotation, GreedyStr)
 
 
 class ParserAndHelperTests(unittest.TestCase):
@@ -395,6 +432,20 @@ class ParserAndHelperTests(unittest.TestCase):
         self.assertEqual((p.action, p.target_lang, p.text, p.voice), ("translate", "ja", "你好", True))
         p = translator.parse_command_args("-v en route to work")
         self.assertEqual((p.action, p.target_lang, p.text, p.voice), ("translate", None, "en route to work", True))
+
+        self.assertEqual(translator.parse_trigger_list("/tl, tr；!fy"), ["/tl", "tr", "!fy"])
+        self.assertEqual(translator.parse_trigger_list([" /tl ", "tr", "/tl"]), ["/tl", "tr"])
+        self.assertEqual(
+            translator.resolve_ai_provider_choice(
+                {"ai_settings": {"ai_provider_id": "sel-1", "ai_provider_manual": "manual-1"}}
+            ),
+            "manual-1",
+        )
+        self.assertEqual(
+            translator.resolve_ai_provider_choice({"ai_settings": {"ai_provider_id": "sel-1"}}),
+            "sel-1",
+        )
+        self.assertEqual(translator.resolve_ai_provider_choice({}), "")
 
     def test_is_word_or_phrase(self):
         self.assertTrue(translator.is_word_or_phrase("run"))
@@ -1263,6 +1314,24 @@ class ServiceAndPluginMockTests(unittest.IsolatedAsyncioTestCase):
         out_oai_fb = [x async for x in plugin_oai.translate_command(ev_oai, GreedyStr(""))]
         self.assertIn("拉面菜单：叉烧面 980日元", out_oai_fb[0])
 
+        # New ai_settings: manual "openai_compat" forces OpenAI-compat vision even if api_provider is bing_cn
+        plugin_ai_img = plugin_main.TranslatePlugin(
+            VisionContext(),
+            {
+                "api_provider": "bing_cn",
+                "custom_api_url": "https://api.example.com/v1/chat/completions",
+                "api_key": "SK_TEST",
+                "openai_model": "gpt-4o-mini",
+                "ai_settings": {"ai_provider_manual": "openai_compat"},
+            },
+        )
+        plugin_ai_img._service = translator.TranslationService(
+            lambda: asyncio.sleep(0, result=MockSession(lambda m, u, kw: MockResponse(200, {"choices": [{"message": {"content": "AI设置识图"}}]})))
+        )
+        out_ai_img = [x async for x in plugin_ai_img.translate_command(ev_oai, GreedyStr(""))]
+        self.assertIn("AI设置识图", out_ai_img[0])
+        await plugin_ai_img.terminate()
+
         await plugin.terminate()
         await plugin_oai.terminate()
 
@@ -1411,6 +1480,166 @@ class ServiceAndPluginMockTests(unittest.IsolatedAsyncioTestCase):
 
         await plugin.terminate()
         await plugin_err.terminate()
+
+    async def test_manual_fyai_provider_selection_and_custom_wake_words(self):
+        calls = []
+
+        class MultiProviderContext:
+            def get_config(self, umo=None):
+                return {"wake_prefix": ["/"]}
+
+            def get_all_providers(self):
+                return [
+                    types.SimpleNamespace(
+                        meta=lambda: types.SimpleNamespace(id="prov-default"),
+                        provider_config={"id": "prov-default", "provider_source_id": "openai"},
+                        get_model=lambda: "gpt-4o-mini",
+                    ),
+                    types.SimpleNamespace(
+                        meta=lambda: types.SimpleNamespace(id="prov-deepseek"),
+                        provider_config={"id": "prov-deepseek", "provider_source_id": "deepseek_main"},
+                        get_model=lambda: "deepseek-chat",
+                    ),
+                ]
+
+            async def get_current_chat_provider_id(self, umo=None):
+                return "prov-default"
+
+            async def llm_generate(self, chat_provider_id, prompt, system_prompt, image_urls=None):
+                calls.append((chat_provider_id, prompt, system_prompt))
+                return types.SimpleNamespace(
+                    role="assistant",
+                    completion_text=f"AI({chat_provider_id}):{prompt}",
+                )
+
+        # 1. api_provider=bing_cn, but /fyai forces AI using blank (current) -> select_provider -> manual override
+        plugin = plugin_main.TranslatePlugin(
+            MultiProviderContext(),
+            {
+                "api_provider": "bing_cn",
+                "enable_auto_fallback": False,
+                "ai_settings": {
+                    "ai_provider_id": "",
+                    "ai_provider_manual": "",
+                },
+                "wake_settings": {
+                    "enable_default_fy": True,
+                    "custom_wake_words": ["/tl", "!tr", "翻译："],
+                    "custom_ai_wake_words": ["/aitl"],
+                },
+            },
+        )
+        # Mock Bing HTTP session so /fy hits Bing while /fyai hits AI
+        def bing_handler(method, url, kw):
+            if "cn.bing.com/translator" in url:
+                return MockResponse(200, "<script>var params_AbusePreventionHelper = [1,\"t\",3600000];IG:\"ABCDEF1234567890ABCDEF\";</script>")
+            if "ttranslatev3" in url:
+                return MockResponse(200, [{"detectedLanguage": {"language": "en"}, "translations": [{"text": "BING_OK"}]}])
+            return MockResponse(200, {})
+
+        plugin._service = translator.TranslationService(
+            lambda: asyncio.sleep(0, result=MockSession(bing_handler))
+        )
+
+        # /fy uses Bing
+        out_fy = [
+            x
+            async for x in plugin.translate_command(
+                AstrMessageEvent("fy Hello world today", [Comp.Plain("/fy Hello world today")]),
+                GreedyStr("Hello world today"),
+            )
+        ]
+        self.assertIn("BING_OK", out_fy[0])
+        self.assertEqual(len(calls), 0)
+
+        # /fyai with blank ai_settings -> uses current active provider ("prov-default")
+        out_fyai_default = [
+            x
+            async for x in plugin.translate_ai_command(
+                AstrMessageEvent("fyai Hello world today", [Comp.Plain("/fyai Hello world today")]),
+                GreedyStr("Hello world today"),
+            )
+        ]
+        self.assertIn("AI(prov-default):Hello world today", out_fyai_default[0])
+
+        # ai_provider_id set via select_provider dropdown
+        plugin.config["ai_settings"]["ai_provider_id"] = "prov-deepseek"
+        out_fyai_sel = [
+            x
+            async for x in plugin.translate_ai_command(
+                AstrMessageEvent("fyai 日语\n早上好", [Comp.Plain("/fyai 日语\n早上好")]),
+                GreedyStr("日语 早上好"),
+            )
+        ]
+        self.assertIn("AI(prov-deepseek):早上好", out_fyai_sel[0])
+
+        # ai_provider_manual overrides ai_provider_id and resolves by model or source name
+        plugin.config["ai_settings"]["ai_provider_id"] = "prov-default"
+        plugin.config["ai_settings"]["ai_provider_manual"] = "deepseek-chat"
+        out_fyai_manual = [
+            x
+            async for x in plugin.translate_ai_command(
+                AstrMessageEvent("fyai Test manual", [Comp.Plain("/fyai Test manual")]),
+                GreedyStr("Test manual"),
+            )
+        ]
+        self.assertIn("AI(prov-deepseek):Test manual", out_fyai_manual[0])
+
+        # Manual custom provider ID not in get_all_providers() passes straight through
+        plugin.config["ai_settings"]["ai_provider_manual"] = "custom-vlm-provider"
+        out_fyai_raw = [
+            x
+            async for x in plugin.translate_ai_command(
+                AstrMessageEvent("fyai Raw ID", [Comp.Plain("/fyai Raw ID")]),
+                GreedyStr("Raw ID"),
+            )
+        ]
+        self.assertIn("AI(custom-vlm-provider):Raw ID", out_fyai_raw[0])
+
+        # Custom wake words via _DynamicWakeFilter + custom_wake_translate
+        wake_filter = plugin_main._DynamicWakeFilter()
+
+        ev_tl = AstrMessageEvent("tl Hello world today", [Comp.Plain("/tl Hello world today")], is_at_or_wake_command=True)
+        ev_tl.set_extra("_consumed_wake_prefix", "/")
+        self.assertTrue(wake_filter.filter(ev_tl, {"wake_prefix": ["/"]}))
+        out_tl = [x async for x in plugin.custom_wake_translate(ev_tl)]
+        self.assertIn("BING_OK", out_tl[0])
+
+        ev_bang = AstrMessageEvent("!tr Hello world today", [Comp.Plain("!tr Hello world today")], is_at_or_wake_command=False)
+        self.assertTrue(wake_filter.filter(ev_bang, {"wake_prefix": ["/"]}))
+        out_bang = [x async for x in plugin.custom_wake_translate(ev_bang)]
+        self.assertIn("BING_OK", out_bang[0])
+
+        ev_colon = AstrMessageEvent("翻译：Hello world today", [Comp.Plain("翻译：Hello world today")], is_at_or_wake_command=False)
+        self.assertTrue(wake_filter.filter(ev_colon, {"wake_prefix": ["/"]}))
+        out_colon = [x async for x in plugin.custom_wake_translate(ev_colon)]
+        self.assertIn("BING_OK", out_colon[0])
+
+        ev_aitl = AstrMessageEvent("aitl Trigger AI", [Comp.Plain("/aitl Trigger AI")], is_at_or_wake_command=True)
+        ev_aitl.set_extra("_consumed_wake_prefix", "/")
+        self.assertTrue(wake_filter.filter(ev_aitl, {"wake_prefix": ["/"]}))
+        out_aitl = [x async for x in plugin.custom_wake_translate(ev_aitl)]
+        self.assertIn("AI(custom-vlm-provider):Trigger AI", out_aitl[0])
+
+        # Disabling default /fy stops /fy in custom filter while keeping /tl
+        plugin.config["wake_settings"]["enable_default_fy"] = False
+        ev_default_fy = AstrMessageEvent("fy Hello", [Comp.Plain("/fy Hello")], is_at_or_wake_command=True)
+        ev_default_fy.set_extra("_consumed_wake_prefix", "/")
+        self.assertFalse(wake_filter.filter(ev_default_fy, {"wake_prefix": ["/"]}))
+
+        # Status output displays AI provider and wake commands
+        out_status = [
+            x
+            async for x in plugin.translate_command(
+                AstrMessageEvent("fy --status", [Comp.Plain("/fy --status")]),
+                GreedyStr("--status"),
+            )
+        ]
+        self.assertIn("custom-vlm-provider", out_status[0])
+        self.assertIn("/tl", out_status[0])
+        self.assertIn("/aitl", out_status[0])
+
+        await plugin.terminate()
 
 
 class _UrllibResp:
