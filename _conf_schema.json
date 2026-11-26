@@ -4,7 +4,7 @@
     "type": "string",
     "default": "bing_cn",
     "obvious_hint": true,
-    "hint": "内置免密钥直连免费 API（默认 Bing 国内直连），也包含小牛/火山/百度/阿里/智谱/硅基流动/Groq 等免费开放平台预设，以及自建与自定义接口。",
+    "hint": "内置免密钥直连免费 API（默认 Bing 国内直连，失败自动回退有道/MyMemory 等），建议首次使用发送 /fy --check 实测当前网络下各预设可用性与延迟后再按需切换。",
     "options": [
       "bing_cn",
       "bing_global",
@@ -36,10 +36,10 @@
       "MyMemory 免费接口 - https://api.mymemory.translated.net/get",
       "Google 翻译（GTX 免费接口） - https://translate.googleapis.com/translate_a/single",
       "Google 翻译（Chrome 扩展接口） - https://clients5.google.com/translate_a/t",
-      "Mozhi 公共实例（AdminForge） - https://mozhi.adminforge.de/api/translate",
-      "Mozhi 公共实例（Aryak） - https://mozhi.aryak.me/api/translate",
-      "Mozhi 公共实例（PussTheCat） - https://mozhi.pussthecat.org/api/translate",
-      "Lingva 接口 - https://lingva.ml/api/v1",
+      "Mozhi 公共实例（AdminForge，实验性） - https://mozhi.adminforge.de/api/translate",
+      "Mozhi 公共实例（Aryak，实验性） - https://mozhi.aryak.me/api/translate",
+      "Mozhi 公共实例（PussTheCat，实验性） - https://mozhi.pussthecat.org/api/translate",
+      "Lingva 接口（实验性） - https://lingva.ml/api/v1",
       "智谱 AI（GLM-4-Flash 长期免费） - https://open.bigmodel.cn/api/paas/v4/chat/completions",
       "硅基流动（免费翻译/开源模型） - https://api.siliconflow.cn/v1/chat/completions",
       "Groq（免费速率限制开源模型） - https://api.groq.com/openai/v1/chat/completions",
@@ -502,6 +502,17 @@
           "min": 5,
           "max": 60,
           "step": 1
+        }
+      },
+      "fallback_total_timeout_seconds": {
+        "description": "回退链总超时上限（秒）",
+        "type": "int",
+        "default": 30,
+        "hint": "限制主接口及所有备用回退引擎的累计等待时间上限，避免多个公共接口同时超时导致长时间无响应。",
+        "slider": {
+          "min": 10,
+          "max": 90,
+          "step": 5
         }
       },
       "max_text_length": {

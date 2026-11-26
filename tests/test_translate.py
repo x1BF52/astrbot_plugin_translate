@@ -1749,6 +1749,124 @@ class ServiceAndPluginMockTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(p_off.voice)
         self.assertEqual(p_off.text, "-v apple")
 
+    async def test_cache_key_isolation_timeout_budget_quota_fallback_and_probe(self):
+        # 1. European Latin diacritic detection
+        self.assertEqual(translator.detect_script_lang("Überraschung Straße"), "de")
+        self.assertEqual(translator.detect_script_lang("¿Cómo estás mañana?"), "es")
+        self.assertEqual(translator.detect_script_lang("Ação e coração"), "pt")
+        self.assertEqual(translator.detect_script_lang("Bonjour, ça va très bien"), "fr")
+        self.assertEqual(translator.detect_script_lang("Hello world"), "en")
+
+        # 2. Composite cache key: same text with different target/source/engine must NOT collide
+        req_count = 0
+
+        def multi_lang_handler(method, url, kw):
+            nonlocal req_count
+            if "cn.bing.com/translator" in url:
+                return MockResponse(200, '<script>var params_AbusePreventionHelper = [1,"t",3600000];IG:"ABCDEF1234567890ABCDEF";</script>')
+            if "ttranslatev3" in url:
+                req_count += 1
+                tgt = (kw.get("data") or {}).get("to", "")
+                return MockResponse(200, [{"detectedLanguage": {"language": "en"}, "translations": [{"text": f"BING_{tgt}_{req_count}"}]}])
+            if "m.youdao.com/translate" in url:
+                req_count += 1
+                return MockResponse(200, f'<ul id="translateResult"><li>YOUDAO_{req_count}</li></ul>')
+            if "api.mymemory.translated.net" in url:
+                return MockResponse(
+                    200,
+                    {
+                        "responseStatus": 200,
+                        "quotaFinished": True,
+                        "responseData": {
+                            "translatedText": "MYMEMORY WARNING: YOU USED ALL AVAILABLE FREE TRANSLATIONS FOR TODAY"
+                        },
+                    },
+                )
+            return MockResponse(500, "err")
+
+        sess = MockSession(multi_lang_handler)
+        svc = translator.TranslationService(lambda: asyncio.sleep(0, result=sess))
+        cfg_bing = {"api_provider": "bing_cn", "enable_auto_fallback": False}
+
+        r_zh1 = await svc.translate("Hello world", cfg_bing, source_lang="en", target_lang="zh-CN")
+        r_zh2 = await svc.translate("Hello world", cfg_bing, source_lang="en", target_lang="zh-CN")
+        r_ja = await svc.translate("Hello world", cfg_bing, source_lang="en", target_lang="ja")
+        r_yd = await svc.translate(
+            "Hello world",
+            {"api_provider": "youdao_web", "enable_auto_fallback": False},
+            source_lang="en",
+            target_lang="zh-CN",
+        )
+        self.assertEqual(r_zh1.translated_text, r_zh2.translated_text)  # Cache hit
+        self.assertNotEqual(r_zh1.translated_text, r_ja.translated_text)  # Different target lang
+        self.assertIn("ja", r_ja.translated_text)
+        self.assertTrue(r_yd.translated_text.startswith("YOUDAO_"))  # Different engine
+        self.assertEqual(req_count, 3)
+
+        # 3. MyMemory quota exhaustion (HTTP 200 + quotaFinished) auto-falls back to youdao_web
+        r_quota_fb = await svc.translate(
+            "Quota fallback sentence",
+            {
+                "api_provider": "mymemory",
+                "enable_auto_fallback": True,
+                "fallback_providers": ["youdao_web"],
+            },
+            source_lang="en",
+            target_lang="zh-CN",
+        )
+        self.assertTrue(r_quota_fb.fallback_used)
+        self.assertEqual(r_quota_fb.provider_key, "youdao_web")
+        self.assertTrue(r_quota_fb.translated_text.startswith("YOUDAO_"))
+
+        # 4. Fallback chain total timeout budget aborts remaining hung providers
+        slow_calls = 0
+
+        async def slow_dispatch(**kwargs):
+            nonlocal slow_calls
+            slow_calls += 1
+            await asyncio.sleep(1.5)
+            return "never", "en"
+
+        svc_slow = translator.TranslationService(lambda: asyncio.sleep(0, result=sess))
+        svc_slow._dispatch_with_ascii_guard = slow_dispatch  # type: ignore[method-assign]
+        svc_slow._timeout_seconds = lambda cfg: 0.3  # type: ignore[method-assign]
+        svc_slow._fallback_total_budget = lambda cfg: 0.55  # type: ignore[method-assign]
+        with self.assertRaises(translator.TranslationError) as ctx:
+            await svc_slow.translate(
+                "Timeout budget test",
+                {
+                    "api_provider": "bing_cn",
+                    "enable_auto_fallback": True,
+                    "fallback_providers": ["youdao_web", "mymemory", "google_free", "lingva_ml"],
+                },
+            )
+        self.assertLessEqual(slow_calls, 2)
+        self.assertIn("超时", str(ctx.exception))
+
+        # 5. /fy --check probe command formats reachable, unreachable, key-required, and self-hosted
+        self.assertEqual(translator.parse_command_args("--check").action, "check")
+        self.assertEqual(translator.parse_command_args("--probe").action, "check")
+
+        plugin = plugin_main.TranslatePlugin(
+            types.SimpleNamespace(get_config=lambda umo=None: {"wake_prefix": ["/"]}),
+            {"api_provider": "bing_cn", "enable_auto_fallback": False},
+        )
+        plugin._service = svc
+        out_check = [
+            x
+            async for x in plugin.translate_command(
+                AstrMessageEvent("fy --check", [Comp.Plain("/fy --check")]),
+                GreedyStr("--check"),
+            )
+        ]
+        self.assertEqual(len(out_check), 1)
+        self.assertIn("预设接口探活报告", out_check[0])
+        self.assertIn("bing_cn", out_check[0])
+        self.assertIn("youdao_web", out_check[0])
+        self.assertIn("zhipu_free", out_check[0])
+        self.assertIn("astrbot_llm", out_check[0])
+        await plugin.terminate()
+
 
 class _UrllibResp:
     def __init__(self, status: int, body_bytes: bytes, final_url: str):

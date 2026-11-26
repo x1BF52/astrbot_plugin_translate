@@ -15,6 +15,7 @@ import re
 import time
 import urllib.parse
 import uuid
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -760,6 +761,10 @@ _THAI_PATTERN = re.compile(r"[\u0e00-\u0e7f]")
 _LATIN_PATTERN = re.compile(r"[A-Za-z\u00c0-\u024f]")
 # Strictly Japanese Shinjitai characters not used in standard Simplified or Traditional Chinese.
 _JA_SHINJITAI_PATTERN = re.compile(r"[県駅気庁図広桜沢渋売乗変伝仮価薬観読続仏検営関栄転]")
+_DE_DIACRITIC_PATTERN = re.compile(r"[äöüßÄÖÜ]")
+_ES_DIACRITIC_PATTERN = re.compile(r"[ñÑ¿¡]")
+_PT_DIACRITIC_PATTERN = re.compile(r"[ãõÃÕ]")
+_FR_DIACRITIC_PATTERN = re.compile(r"[œŒçÇéèêëàùâîôûÉÈÊËÀÙÂÎÔÛ]")
 DEFAULT_VOICE_FLAGS: tuple[str, ...] = ("-v", "--voice", "--tts", "--say")
 _VOICE_FLAG_PATTERN = re.compile(
     r"^(?:--say|--tts|--voice|-v)(?:$|[\s\r\n]+([\s\S]*))$",
@@ -816,6 +821,14 @@ def detect_script_lang(text: str) -> str:
         return "ar"
     if _THAI_PATTERN.search(text):
         return "th"
+    if _ES_DIACRITIC_PATTERN.search(text):
+        return "es"
+    if _PT_DIACRITIC_PATTERN.search(text):
+        return "pt"
+    if _DE_DIACRITIC_PATTERN.search(text):
+        return "de"
+    if _FR_DIACRITIC_PATTERN.search(text):
+        return "fr"
     return "en"
 
 
@@ -945,6 +958,8 @@ def parse_command_args(
         return ParsedCommand(action="help")
     if lower in {"--status", "--apis", "--engines"}:
         return ParsedCommand(action="status")
+    if lower in {"--check", "--probe", "--test"}:
+        return ParsedCommand(action="check")
     if lower in {"--langs", "--languages", "--lang"}:
         return ParsedCommand(action="langs")
 
@@ -1396,13 +1411,31 @@ def resolve_ai_provider_choice(config: dict[str, Any]) -> str:
     return str(legacy_cfg.get("image_astrbot_provider_id") or "").strip()
 
 
+@dataclass
+class PresetProbeResult:
+    """Health probe outcome for a single translation preset."""
+
+    key: str
+    name: str
+    category: str  # "keyless" | "key_required" | "self_hosted" | "builtin_llm"
+    status: str  # "ok" | "fail" | "needs_key" | "key_configured" | "self_hosted" | "builtin"
+    latency_ms: int = 0
+    detail: str = ""
+
+
 class TranslationService:
-    """Async multi-engine translation dispatcher with fallback and token caching."""
+    """Async multi-engine translation dispatcher with fallback, caching, and health probing."""
+
+    _CACHE_MAX_SIZE = 256
+    _CACHE_TTL_SECONDS = 180.0
 
     def __init__(self, session_getter: Callable[[], Awaitable[aiohttp.ClientSession]]):
         self._get_session = session_getter
         self._bing_tokens: dict[str, dict[str, Any]] = {}
         self._bing_locks: dict[str, asyncio.Lock] = {}
+        self._result_cache: OrderedDict[
+            tuple[Any, ...], tuple[float, TranslationResult]
+        ] = OrderedDict()
 
     def _request_proxy(self, url: str, config: dict[str, Any]) -> str | None:
         proxy = str(config.get("proxy_url") or "").strip()
@@ -1410,14 +1443,87 @@ class TranslationService:
             return None
         return proxy
 
-    def _timeout(self, config: dict[str, Any]) -> aiohttp.ClientTimeout:
+    def _timeout_seconds(self, config: dict[str, Any]) -> float:
         adv = config.get("advanced") or {}
         seconds = adv.get("timeout_seconds", 15)
         try:
-            val = max(3, min(120, int(seconds)))
+            return float(max(3, min(120, int(seconds))))
         except (TypeError, ValueError):
-            val = 15
-        return aiohttp.ClientTimeout(total=val)
+            return 15.0
+
+    def _timeout(self, config: dict[str, Any]) -> aiohttp.ClientTimeout:
+        return aiohttp.ClientTimeout(total=self._timeout_seconds(config))
+
+    def _fallback_total_budget(self, config: dict[str, Any]) -> float:
+        adv = config.get("advanced") or {}
+        raw = adv.get("fallback_total_timeout_seconds")
+        if raw is not None and str(raw).strip() != "":
+            try:
+                return float(max(5, min(120, int(raw))))
+            except (TypeError, ValueError):
+                pass
+        per_req = self._timeout_seconds(config)
+        return min(max(per_req * 2.0, 20.0), 45.0)
+
+    def _make_cache_key(
+        self,
+        *,
+        text: str,
+        source_lang: str,
+        target_lang: str,
+        engine_key: str,
+        dict_mode: bool,
+        config: dict[str, Any],
+    ) -> tuple[Any, ...]:
+        """Build a composite cache key: text + source + target + engine + config discriminator."""
+        adv = config.get("advanced") or {}
+        if engine_key == "astrbot_llm":
+            variant = resolve_ai_provider_choice(config)
+        else:
+            variant = (
+                str(config.get("custom_api_url") or "").strip(),
+                str(adv.get("llm_model") or "").strip(),
+            )
+        return (
+            text.strip(),
+            source_lang,
+            target_lang,
+            engine_key,
+            bool(dict_mode),
+            variant,
+        )
+
+    def _cache_get(self, key: tuple[Any, ...]) -> TranslationResult | None:
+        entry = self._result_cache.get(key)
+        if not entry:
+            return None
+        expires_at, cached_res = entry
+        if time.monotonic() >= expires_at:
+            self._result_cache.pop(key, None)
+            return None
+        self._result_cache.move_to_end(key)
+        return TranslationResult(
+            translated_text=cached_res.translated_text,
+            provider_key=cached_res.provider_key,
+            provider_name=cached_res.provider_name,
+            source_lang=cached_res.source_lang,
+            target_lang=cached_res.target_lang,
+            detected_lang=cached_res.detected_lang,
+            fallback_used=cached_res.fallback_used,
+            errors=list(cached_res.errors) if cached_res.errors else None,
+            dict_entries=list(cached_res.dict_entries) if cached_res.dict_entries else None,
+        )
+
+    def _cache_put(self, key: tuple[Any, ...], result: TranslationResult) -> None:
+        if not result.translated_text:
+            return
+        self._result_cache[key] = (
+            time.monotonic() + self._CACHE_TTL_SECONDS,
+            result,
+        )
+        self._result_cache.move_to_end(key)
+        while len(self._result_cache) > self._CACHE_MAX_SIZE:
+            self._result_cache.popitem(last=False)
 
     async def _read_json_response(
         self,
@@ -1501,65 +1607,219 @@ class TranslationService:
                     if isinstance(fb, str) and fb in PROVIDER_PRESETS and fb not in chain:
                         chain.append(fb)
 
-        errors: list[str] = []
-        for idx, provider_key in enumerate(chain):
-            preset = PROVIDER_PRESETS[provider_key]
-            try:
-                use_custom = idx == 0
-                prefetched_yd: dict[str, Any] | None = None
-                mixed_blocks = (
-                    _split_mixed_script_blocks(text)
-                    if source_lang == "auto"
-                    and preset.kind not in {"openai_compat", "astrbot_llm"}
-                    else None
-                )
-                if mixed_blocks:
-                    cleaned, detected = await self._translate_mixed_blocks(
-                        blocks=mixed_blocks,
-                        preset=preset,
-                        target_lang=resolved_target,
-                        config=config,
-                        use_custom_override=use_custom,
-                        llm_callback=llm_callback,
-                    )
-                else:
-                    cleaned, detected, prefetched_yd = await self._dispatch_with_ascii_guard(
-                        preset=preset,
-                        text=text,
-                        source_lang=source_lang,
-                        target_lang=resolved_target,
-                        config=config,
-                        use_custom_override=use_custom,
-                        llm_callback=llm_callback,
-                        dict_mode=dict_mode,
-                    )
+        cache_key = self._make_cache_key(
+            text=text,
+            source_lang=source_lang,
+            target_lang=resolved_target,
+            engine_key=chain[0],
+            dict_mode=dict_mode,
+            config=config,
+        )
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
 
-                dict_entries: list[str] | None = None
-                if dict_mode and preset.kind not in {"openai_compat", "astrbot_llm"}:
-                    dict_entries = await self._lookup_dictionary(
-                        text=text.strip(),
-                        source_lang=source_lang,
-                        target_lang=resolved_target,
-                        detected_lang=detected,
-                        config=config,
-                        prefetched_youdao=prefetched_yd,
-                    ) or None
-                return TranslationResult(
-                    translated_text=cleaned,
-                    provider_key=preset.key,
-                    provider_name=preset.name,
+        per_req_timeout = self._timeout_seconds(config)
+        total_budget = self._fallback_total_budget(config)
+        deadline = time.monotonic() + total_budget
+
+        async def _run_single_provider(
+            idx: int,
+            provider_key: str,
+            preset: ProviderPreset,
+        ) -> TranslationResult:
+            use_custom = idx == 0
+            prefetched_yd: dict[str, Any] | None = None
+            mixed_blocks = (
+                _split_mixed_script_blocks(text)
+                if source_lang == "auto"
+                and preset.kind not in {"openai_compat", "astrbot_llm"}
+                else None
+            )
+            if mixed_blocks:
+                cleaned, detected = await self._translate_mixed_blocks(
+                    blocks=mixed_blocks,
+                    preset=preset,
+                    target_lang=resolved_target,
+                    config=config,
+                    use_custom_override=use_custom,
+                    llm_callback=llm_callback,
+                )
+            else:
+                cleaned, detected, prefetched_yd = await self._dispatch_with_ascii_guard(
+                    preset=preset,
+                    text=text,
+                    source_lang=source_lang,
+                    target_lang=resolved_target,
+                    config=config,
+                    use_custom_override=use_custom,
+                    llm_callback=llm_callback,
+                    dict_mode=dict_mode,
+                )
+
+            dict_entries: list[str] | None = None
+            if dict_mode and preset.kind not in {"openai_compat", "astrbot_llm"}:
+                dict_entries = await self._lookup_dictionary(
+                    text=text.strip(),
                     source_lang=source_lang,
                     target_lang=resolved_target,
                     detected_lang=detected,
-                    fallback_used=(idx > 0),
-                    errors=errors or None,
-                    dict_entries=dict_entries,
+                    config=config,
+                    prefetched_youdao=prefetched_yd,
+                ) or None
+            return TranslationResult(
+                translated_text=cleaned,
+                provider_key=preset.key,
+                provider_name=preset.name,
+                source_lang=source_lang,
+                target_lang=resolved_target,
+                detected_lang=detected,
+                fallback_used=(idx > 0),
+                errors=errors or None,
+                dict_entries=dict_entries,
+            )
+
+        errors: list[str] = []
+        for idx, provider_key in enumerate(chain):
+            preset = PROVIDER_PRESETS[provider_key]
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.25:
+                errors.append(f"已达回退总超时上限 ({int(total_budget)}s)，中止后续回退")
+                break
+            step_timeout = min(per_req_timeout, remaining)
+            try:
+                res = await asyncio.wait_for(
+                    _run_single_provider(idx, provider_key, preset),
+                    timeout=step_timeout,
                 )
+                self._cache_put(cache_key, res)
+                return res
+            except asyncio.TimeoutError:
+                errors.append(f"{preset.name}: 请求超时 ({step_timeout:.1f}s)")
             except Exception as exc:
                 safe_err = redact_config_secrets(str(exc), config)
                 errors.append(f"{preset.name}: {safe_err}")
 
         raise TranslationError("；".join(errors) if errors else "所有翻译接口均请求失败")
+
+    async def probe_presets(
+        self,
+        config: dict[str, Any],
+        *,
+        timeout_seconds: float = 4.0,
+    ) -> list[PresetProbeResult]:
+        """Concurrently probe keyless free presets and classify key-required / self-hosted ones."""
+        probe_cfg = dict(config)
+        probe_adv = dict(config.get("advanced") or {})
+        probe_adv["timeout_seconds"] = max(3, int(round(timeout_seconds)))
+        probe_adv["enable_dict_lookup"] = False
+        probe_cfg["advanced"] = probe_adv
+        probe_cfg["enable_auto_fallback"] = False
+
+        keyless_kinds = {
+            "bing",
+            "youdao_web",
+            "mymemory",
+            "google_gtx",
+            "google_clients5",
+            "mozhi",
+            "lingva",
+        }
+        key_required_keys = {
+            "zhipu_free",
+            "siliconflow_free",
+            "groq_free",
+            "niutrans",
+            "volcengine",
+            "baidu_fanyi",
+            "aliyun_mt",
+        }
+        has_api_key = bool(str(config.get("api_key") or "").strip())
+
+        async def _probe_one(preset: ProviderPreset) -> PresetProbeResult:
+            if preset.key == "astrbot_llm":
+                return PresetProbeResult(
+                    key=preset.key,
+                    name=preset.name,
+                    category="builtin_llm",
+                    status="builtin",
+                    detail="复用 AstrBot 内置模型",
+                )
+            if preset.key in key_required_keys:
+                return PresetProbeResult(
+                    key=preset.key,
+                    name=preset.name,
+                    category="key_required",
+                    status="key_configured" if has_api_key else "needs_key",
+                    detail="已填写 Key" if has_api_key else "需填免费 API Key",
+                )
+            if preset.kind not in keyless_kinds:
+                return PresetProbeResult(
+                    key=preset.key,
+                    name=preset.name,
+                    category="self_hosted",
+                    status="self_hosted",
+                    detail="需自建服务或填写自定义地址",
+                )
+
+            start = time.monotonic()
+            try:
+                translated, _ = await asyncio.wait_for(
+                    self._dispatch_provider(
+                        preset=preset,
+                        text="hello",
+                        source_lang="en",
+                        target_lang="zh-CN",
+                        config=probe_cfg,
+                        use_custom_override=False,
+                        llm_callback=None,
+                        dict_mode=False,
+                    ),
+                    timeout=timeout_seconds,
+                )
+                elapsed_ms = int((time.monotonic() - start) * 1000)
+                if translated and translated.strip():
+                    return PresetProbeResult(
+                        key=preset.key,
+                        name=preset.name,
+                        category="keyless",
+                        status="ok",
+                        latency_ms=elapsed_ms,
+                        detail=f"{elapsed_ms}ms",
+                    )
+                return PresetProbeResult(
+                    key=preset.key,
+                    name=preset.name,
+                    category="keyless",
+                    status="fail",
+                    latency_ms=elapsed_ms,
+                    detail="返回为空",
+                )
+            except asyncio.TimeoutError:
+                elapsed_ms = int((time.monotonic() - start) * 1000)
+                return PresetProbeResult(
+                    key=preset.key,
+                    name=preset.name,
+                    category="keyless",
+                    status="fail",
+                    latency_ms=elapsed_ms,
+                    detail=f"超时 (>{timeout_seconds:.0f}s)",
+                )
+            except Exception as exc:
+                elapsed_ms = int((time.monotonic() - start) * 1000)
+                safe_err = redact_config_secrets(str(exc), config)
+                short_err = safe_err.splitlines()[0][:48] if safe_err else "不可达"
+                return PresetProbeResult(
+                    key=preset.key,
+                    name=preset.name,
+                    category="keyless",
+                    status="fail",
+                    latency_ms=elapsed_ms,
+                    detail=short_err,
+                )
+
+        tasks = [_probe_one(preset) for preset in PROVIDER_PRESETS.values()]
+        return list(await asyncio.gather(*tasks))
 
     async def _dispatch_with_ascii_guard(
         self,
@@ -1990,7 +2250,11 @@ class TranslationService:
             if status != 200:
                 detail = data.get("responseDetails") or f"status={status}"
                 raise TranslationError(f"MyMemory 错误: {detail}")
+            if data.get("quotaFinished") is True:
+                raise TranslationError("MyMemory 每日免费额度已用尽")
             translated = (data.get("responseData") or {}).get("translatedText", "")
+            if "MYMEMORY WARNING" in translated.upper():
+                raise TranslationError("MyMemory 每日免费额度已用尽")
             return html.unescape(translated), actual_src if source_lang == "auto" else ""
 
         return await self._translate_chunked(text, 450, _send_mymemory)

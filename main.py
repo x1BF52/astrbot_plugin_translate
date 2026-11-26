@@ -930,7 +930,7 @@ class TranslatePlugin(Star):
                 f"{voice_line}"
                 f"- 引用任意消息并发送 `{ex_cmd}`（支持加目标语如 `{ex_cmd} en`）\n"
                 f"- 指定目标语：`{ex_cmd} 日语 你好` | `{ex_cmd} ->ja 你好` | `{ex_cmd} en->zh Hello`\n"
-                f"- 查看支持语种：`{ex_cmd} --langs` | 查看配置状态：`{ex_cmd} --status`\n\n"
+                f"- 查看支持语种：`{ex_cmd} --langs` | 配置状态：`{ex_cmd} --status` | 预设探活：`{ex_cmd} --check`\n\n"
                 f"**默认目标**：{target_desc}"
             )
         normal_disp_plain = "、".join(normal_trigs) if normal_trigs else "（已停用）"
@@ -952,7 +952,7 @@ class TranslatePlugin(Star):
             f"{voice_line_plain}"
             f"• 引用任意消息并发送 {ex_cmd}（支持加目标语如 {ex_cmd} en）\n"
             f"• 指定目标语：{ex_cmd} 日语 你好  |  {ex_cmd} ->ja 你好  |  {ex_cmd} en->zh Hello\n"
-            f"• 查看支持语种：{ex_cmd} --langs  |  查看配置状态：{ex_cmd} --status\n"
+            f"• 查看语种：{ex_cmd} --langs  |  配置状态：{ex_cmd} --status  |  预设探活：{ex_cmd} --check\n"
             f"默认目标：{target_desc}"
         )
 
@@ -1052,6 +1052,7 @@ class TranslatePlugin(Star):
                 f"- **输出格式**：{output_fmt}\n"
                 f"- **备用回退**：{fallback_line}\n"
                 f"- **代理模式**：{proxy}\n\n"
+                "提示：发送 `/fy --check` 可并发实测所有预设在当前网络下的可用性与延迟。\n"
                 "可在 AstrBot 管理面板「插件管理 -> 多引擎翻译插件 -> 配置」中修改。"
             )
         return (
@@ -1066,8 +1067,66 @@ class TranslatePlugin(Star):
             f"• 输出格式：{output_fmt}\n"
             f"• 备用回退：{fallback_line}\n"
             f"• 代理模式：{proxy}\n"
+            "提示：发送 /fy --check 可并发探活所有预设在当前网络下的可用性与延迟。\n"
             "可在 AstrBot 管理面板「插件管理 -> 多引擎翻译插件 -> 配置」中切换预设免费 API 或填写自定义接口。"
         )
+
+    async def _build_probe_text(self) -> str:
+        results = await self._service.probe_presets(self.config, timeout_seconds=4.0)
+        keyless = [r for r in results if r.category == "keyless"]
+        key_req = [r for r in results if r.category == "key_required"]
+        self_hosted = [r for r in results if r.category in {"self_hosted", "builtin_llm"}]
+
+        ok_list = sorted([r for r in keyless if r.status == "ok"], key=lambda x: x.latency_ms)
+        fail_list = [r for r in keyless if r.status != "ok"]
+        active_key = str(self.config.get("api_provider") or "bing_cn")
+
+        def _tag(key: str) -> str:
+            return " [当前]" if key == active_key else ""
+
+        if self._use_markdown():
+            lines = [
+                f"**预设接口探活报告**（免密可用 {len(ok_list)}/{len(keyless)}）",
+                "",
+                "**免密免费接口（已实测）**",
+            ]
+            for r in ok_list:
+                lines.append(f"- ✅ `{r.key}` {r.name}{_tag(r.key)} — `{r.detail}`")
+            for r in fail_list:
+                lines.append(f"- ❌ `{r.key}` {r.name}{_tag(r.key)} — {r.detail}")
+            lines.append("")
+            lines.append("**免费开放平台 / 大模型（需 API Key）**")
+            for r in key_req:
+                icon = "🔑" if r.status == "needs_key" else "✅"
+                lines.append(f"- {icon} `{r.key}` {r.name}{_tag(r.key)} — {r.detail}")
+            lines.append("")
+            lines.append("**自建 / 内置扩展**")
+            for r in self_hosted:
+                icon = "🤖" if r.status == "builtin" else "🏠"
+                lines.append(f"- {icon} `{r.key}` {r.name}{_tag(r.key)} — {r.detail}")
+            if ok_list:
+                lines.append(f"\n建议主接口优先选用延迟最低的 `{ok_list[0].key}`（{ok_list[0].detail}）。")
+            return "\n".join(lines)
+
+        lines = [
+            f"预设接口探活报告（免密可用 {len(ok_list)}/{len(keyless)}）：",
+            "【免密免费接口（已实测）】",
+        ]
+        for r in ok_list:
+            lines.append(f"  ✅ {r.name} ({r.key}){_tag(r.key)}：{r.detail}")
+        for r in fail_list:
+            lines.append(f"  ❌ {r.name} ({r.key}){_tag(r.key)}：{r.detail}")
+        lines.append("【需填免费 Key 的平台】")
+        for r in key_req:
+            icon = "🔑" if r.status == "needs_key" else "✅"
+            lines.append(f"  {icon} {r.name} ({r.key}){_tag(r.key)}：{r.detail}")
+        lines.append("【自建 / 内置扩展】")
+        for r in self_hosted:
+            icon = "🤖" if r.status == "builtin" else "🏠"
+            lines.append(f"  {icon} {r.name} ({r.key}){_tag(r.key)}：{r.detail}")
+        if ok_list:
+            lines.append(f"建议主接口优先选用当前延迟最低的 {ok_list[0].name} ({ok_list[0].key}，{ok_list[0].detail})。")
+        return "\n".join(lines)
 
     def _format_output(self, original: str, res: TranslationResult) -> str:
         adv = self.config.get("advanced") or {}
@@ -1182,6 +1241,9 @@ class TranslatePlugin(Star):
             return
         if parsed.action == "status":
             yield self._make_result(event, self._build_status_text())
+            return
+        if parsed.action == "check":
+            yield self._make_result(event, await self._build_probe_text())
             return
         if parsed.action == "langs":
             yield self._make_result(event, self._build_langs_text())
