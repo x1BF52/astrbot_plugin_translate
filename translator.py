@@ -43,6 +43,59 @@ DEFAULT_LLM_DICT_PROMPT = (
 )
 
 
+def build_llm_system_prompt(
+    custom_prompt: str,
+    source_label: str,
+    target_label: str,
+    *,
+    dict_mode: bool = False,
+    use_markdown: bool = False,
+) -> str:
+    """Build LLM system prompt tailored to translation vs dictionary and Markdown mode."""
+    cleaned_custom = (custom_prompt or "").strip()
+    if cleaned_custom and cleaned_custom != DEFAULT_LLM_PROMPT:
+        tpl = cleaned_custom
+    elif dict_mode:
+        style = (
+            "Format clearly using concise Markdown (bold part-of-speech labels like **n.**, **v.**, bullet lists, and inline code for phonetics)."
+            if use_markdown
+            else "Use clean plain text with bullet prefix '• ' and NO Markdown syntax (no **, #, or backticks)."
+        )
+        tpl = f"{DEFAULT_LLM_DICT_PROMPT}\n{style}"
+    else:
+        tpl = (
+            DEFAULT_LLM_PROMPT
+            if use_markdown
+            else f"{DEFAULT_LLM_PROMPT} Output plain text without extra Markdown formatting."
+        )
+    return tpl.replace("{target_lang}", target_label).replace("{source_lang}", source_label)
+
+
+def format_dict_entries_markdown(entries: list[str]) -> list[str]:
+    """Format dictionary entry lines into readable Markdown list items."""
+    out: list[str] = []
+    for line in entries:
+        if line.startswith("• "):
+            body = line[2:].strip()
+            match = re.match(r"^([A-Za-z]+\.|\[[^\]]+\]|【[^】]+】|释义)\s+([\s\S]+)$", body)
+            if match:
+                out.append(f"- **{match.group(1)}** {match.group(2)}")
+            else:
+                out.append(f"- {body}")
+        elif line.startswith("常见搭配："):
+            rest = line[len("常见搭配：") :].strip()
+            rest = re.sub(
+                r"([A-Za-z][A-Za-z0-9' -]*[A-Za-z0-9])\s*\(([^)]+)\)",
+                r"`\1` (\2)",
+                rest,
+            )
+            out.append(f"- **常见搭配**：{rest}")
+        else:
+            formatted = re.sub(r"/([^/\n]+)/", r"`/\1/`", line)
+            out.append(f"- **发音**：{formatted}")
+    return out
+
+
 class TranslationError(Exception):
     """Raised when a translation provider fails or returns invalid data."""
 
@@ -1899,14 +1952,15 @@ class TranslationService:
             if preset.key == "openai_compat"
             else ""
         )
-        if custom_prompt and custom_prompt != DEFAULT_LLM_PROMPT:
-            prompt_tpl = custom_prompt
-        else:
-            prompt_tpl = DEFAULT_LLM_DICT_PROMPT if dict_mode else DEFAULT_LLM_PROMPT
-
-        system_prompt = prompt_tpl.replace(
-            "{target_lang}", get_lang_label(target_lang)
-        ).replace("{source_lang}", get_lang_label(source_lang))
+        adv = config.get("advanced") or {}
+        use_markdown = bool(adv.get("output_markdown", False))
+        system_prompt = build_llm_system_prompt(
+            custom_prompt,
+            get_lang_label(source_lang),
+            get_lang_label(target_lang),
+            dict_mode=dict_mode,
+            use_markdown=use_markdown,
+        )
 
         headers = {"Content-Type": "application/json"}
         if api_key:

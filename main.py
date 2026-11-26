@@ -13,14 +13,14 @@ from astrbot.api.star import Context, Star
 from astrbot.core.star.filter.command import GreedyStr
 
 from .translator import (
-    DEFAULT_LLM_DICT_PROMPT,
-    DEFAULT_LLM_PROMPT,
     LANG_LABELS,
     PROVIDER_PRESETS,
     TranslationError,
     TranslationResult,
     TranslationService,
+    build_llm_system_prompt,
     clean_llm_translation,
+    format_dict_entries_markdown,
     get_lang_label,
     parse_command_args,
     redact_config_secrets,
@@ -180,6 +180,16 @@ class TranslatePlugin(Star):
         except Exception:
             return False
 
+    def _use_markdown(self) -> bool:
+        adv = self.config.get("advanced") or {}
+        return bool(adv.get("output_markdown", False))
+
+    def _make_result(self, event: AstrMessageEvent, text: str):
+        res = event.plain_result(text)
+        if hasattr(res, "use_markdown"):
+            res.use_markdown(self._use_markdown())
+        return res
+
     async def _call_astrbot_llm(
         self,
         event: AstrMessageEvent,
@@ -189,10 +199,13 @@ class TranslatePlugin(Star):
         dict_mode: bool = False,
     ) -> str:
         """Translate via AstrBot's active chat LLM provider."""
-        prompt_tpl = DEFAULT_LLM_DICT_PROMPT if dict_mode else DEFAULT_LLM_PROMPT
-        system_prompt = prompt_tpl.replace(
-            "{target_lang}", target_label
-        ).replace("{source_lang}", source_label)
+        system_prompt = build_llm_system_prompt(
+            "",
+            source_label,
+            target_label,
+            dict_mode=dict_mode,
+            use_markdown=self._use_markdown(),
+        )
 
         llm_resp = None
         if hasattr(self.context, "get_current_chat_provider_id") and hasattr(
@@ -246,6 +259,15 @@ class TranslatePlugin(Star):
         target_desc = (
             "智能中英互译" if default_target == "auto_zh_en" else get_lang_label(default_target)
         )
+        if self._use_markdown():
+            return (
+                "**翻译插件使用说明**\n"
+                "- `/fy <文本>` 或 `/翻译 <文本>`（单词/短语自动附带词性与多义）\n"
+                "- 引用任意消息并发送 `/fy` 或 `/翻译`（支持加目标语如 `/fy en`）\n"
+                "- 指定目标语：`/fy 日语 你好` | `/fy ->ja 你好` | `/fy en->zh Hello`\n"
+                "- 查看支持语种：`/fy --langs` | 查看配置状态：`/fy --status`\n\n"
+                f"**默认目标**：{target_desc}"
+            )
         return (
             "翻译插件使用说明：\n"
             "• /fy <文本> 或 /翻译 <文本>（单词/短语自动附带词性与多义）\n"
@@ -256,6 +278,17 @@ class TranslatePlugin(Star):
         )
 
     def _build_langs_text(self) -> str:
+        if self._use_markdown():
+            pairs = [
+                f"{label} (`{code}`)"
+                for code, label in LANG_LABELS.items()
+                if code != "auto"
+            ]
+            return (
+                "**支持的目标语种代码与名称**\n"
+                + "、".join(pairs)
+                + "\n\n用法示例：`/fy 日语 你好` | `/fy ->zh-TW 你好` | `/fy en->fr Hello`"
+            )
         pairs = [
             f"{label} ({code})"
             for code, label in LANG_LABELS.items()
@@ -289,12 +322,25 @@ class TranslatePlugin(Star):
             if self.config.get("enable_auto_fallback", True) and fallbacks
             else "已关闭"
         )
+        output_fmt = "Markdown" if self._use_markdown() else "纯文本"
         proxy = "已配置" if str(self.config.get("proxy_url") or "").strip() else "直连"
+        if self._use_markdown():
+            return (
+                "**当前翻译配置状态**\n"
+                f"- **主接口**：{preset.name}\n"
+                f"- **接口地址**：`{active_url}`\n"
+                f"- **默认目标**：{target_desc}\n"
+                f"- **输出格式**：{output_fmt}\n"
+                f"- **备用回退**：{fallback_line}\n"
+                f"- **代理模式**：{proxy}\n\n"
+                "可在 AstrBot 管理面板「插件管理 -> 多引擎翻译插件 -> 配置」中修改。"
+            )
         return (
             "当前翻译配置状态：\n"
             f"• 主接口：{preset.name}\n"
             f"• 接口地址：{active_url}\n"
             f"• 默认目标：{target_desc}\n"
+            f"• 输出格式：{output_fmt}\n"
             f"• 备用回退：{fallback_line}\n"
             f"• 代理模式：{proxy}\n"
             "可在 AstrBot 管理面板「插件管理 -> 多引擎翻译插件 -> 配置」中切换预设免费 API 或填写自定义接口。"
@@ -305,6 +351,7 @@ class TranslatePlugin(Star):
         show_engine = adv.get("show_engine_name", False)
         show_lang = adv.get("show_detected_lang", True)
         show_original = adv.get("show_original", False)
+        use_markdown = self._use_markdown()
 
         meta_parts: list[str] = []
         if show_lang:
@@ -316,16 +363,24 @@ class TranslatePlugin(Star):
 
         lines: list[str] = []
         if meta_parts:
-            lines.append(f"[{' | '.join(meta_parts)}]")
+            header = f"[{' | '.join(meta_parts)}]"
+            lines.append(f"**{header}**" if use_markdown else header)
         if show_original:
-            lines.append(f"原文：{original}")
-            lines.append(f"译文：{res.translated_text}")
+            if use_markdown:
+                lines.append(f"**原文：**\n{original}\n\n**译文：**\n{res.translated_text}")
+            else:
+                lines.append(f"原文：{original}")
+                lines.append(f"译文：{res.translated_text}")
         else:
             lines.append(res.translated_text)
         if res.dict_entries:
             lines.append("")
-            lines.append("词典释义：")
-            lines.extend(res.dict_entries)
+            if use_markdown:
+                lines.append("**词典释义**")
+                lines.extend(format_dict_entries_markdown(res.dict_entries))
+            else:
+                lines.append("词典释义：")
+                lines.extend(res.dict_entries)
         return "\n".join(lines)
 
     @filter.command("fy", alias={"翻译"})
@@ -336,24 +391,24 @@ class TranslatePlugin(Star):
         parsed = parse_command_args(raw_body, has_reply=has_reply)
 
         if parsed.action == "help":
-            yield event.plain_result(self._build_help_text())
+            yield self._make_result(event, self._build_help_text())
             return
         if parsed.action == "status":
-            yield event.plain_result(self._build_status_text())
+            yield self._make_result(event, self._build_status_text())
             return
         if parsed.action == "langs":
-            yield event.plain_result(self._build_langs_text())
+            yield self._make_result(event, self._build_langs_text())
             return
 
         content = parsed.text
         if not content and has_reply:
             content = await self._extract_reply_text(event)
             if not content:
-                yield event.plain_result("引用的消息中没有检测到可翻译的文本内容。")
+                yield self._make_result(event, "引用的消息中没有检测到可翻译的文本内容。")
                 return
 
         if not content:
-            yield event.plain_result(self._build_help_text())
+            yield self._make_result(event, self._build_help_text())
             return
 
         adv = self.config.get("advanced") or {}
@@ -363,8 +418,9 @@ class TranslatePlugin(Star):
             max_len = 3000
 
         if len(content) > max_len:
-            yield event.plain_result(
-                f"待翻译文本长度 ({len(content)} 字符) 超过上限 ({max_len} 字符)，请分段后重试。"
+            yield self._make_result(
+                event,
+                f"待翻译文本长度 ({len(content)} 字符) 超过上限 ({max_len} 字符)，请分段后重试。",
             )
             return
 
@@ -389,12 +445,12 @@ class TranslatePlugin(Star):
         except TranslationError as exc:
             safe_msg = redact_config_secrets(str(exc), self.config)
             logger.warning("翻译失败: %s", safe_msg)
-            yield event.plain_result(f"翻译失败：{safe_msg}")
+            yield self._make_result(event, f"翻译失败：{safe_msg}")
             return
         except Exception as exc:
             safe_msg = redact_config_secrets(str(exc), self.config)
             logger.error("翻译插件异常: %s", safe_msg, exc_info=True)
-            yield event.plain_result(f"翻译时发生内部错误：{safe_msg}")
+            yield self._make_result(event, f"翻译时发生内部错误：{safe_msg}")
             return
 
-        yield event.plain_result(self._format_output(content, result))
+        yield self._make_result(event, self._format_output(content, result))

@@ -309,6 +309,12 @@
         "default": true,
         "hint": "输入单词或短语时，自动附带音标、词性分类、多种释义及常见搭配。"
       },
+      "output_markdown": {
+        "description": "使用 Markdown 格式输出",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后使用加粗、列表、行内代码等 Markdown 排版并标记消息为 Markdown 发送（适合 WebUI / Telegram / Discord / QQ 官方 Bot / t2i）；普通 QQ/微信建议保持关闭以免显示星号与反引号。"
+      },
       "show_detected_lang": {
         "description": "在回复中显示语种方向",
         "type": "bool",

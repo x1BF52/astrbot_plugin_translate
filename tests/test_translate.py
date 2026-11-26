@@ -250,6 +250,7 @@ class MetadataAndSchemaTests(unittest.TestCase):
         adv_items = schema["advanced"]["items"]
         self.assertIs(adv_items["show_engine_name"]["default"], False)
         self.assertIs(adv_items["enable_dict_lookup"]["default"], True)
+        self.assertIs(adv_items["output_markdown"]["default"], False)
 
     def test_metadata_yaml_required_fields(self):
         raw_lines = (PKG_DIR / "metadata.yaml").read_text(encoding="utf-8").splitlines()
@@ -728,6 +729,85 @@ class ServiceAndPluginMockTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("词典释义：", formatted)
         self.assertIn("• v. 跑，奔跑；运行", formatted)
         self.assertNotIn("Bing", formatted)
+
+        # Markdown mode formatting and MessageEventResult.use_markdown(True/False)
+        class RichResult(str):
+            def __new__(cls, text):
+                obj = super().__new__(cls, text)
+                obj.use_markdown_ = None
+                return obj
+
+            def use_markdown(self, flag=True):
+                self.use_markdown_ = flag
+                return self
+
+        class RichEvent(AstrMessageEvent):
+            def plain_result(self, text: str):
+                return RichResult(text)
+
+        md_plugin = plugin_main.TranslatePlugin(
+            ModernContext(),
+            {
+                "api_provider": "astrbot_llm",
+                "default_target_lang": "auto_zh_en",
+                "enable_auto_fallback": False,
+                "advanced": {
+                    "output_markdown": True,
+                    "show_detected_lang": True,
+                    "show_original": True,
+                },
+            },
+        )
+        md_formatted = md_plugin._format_output(
+            "run",
+            translator.TranslationResult(
+                translated_text="跑",
+                provider_key="bing_cn",
+                provider_name="Bing 翻译 (国内版)",
+                source_lang="auto",
+                target_lang="zh-CN",
+                detected_lang="en",
+                dict_entries=[
+                    "英 /rʌn/  美 /rʌn/",
+                    "• v. 跑，奔跑；运行",
+                    "常见搭配：in the long run (长远；终究)",
+                ],
+            ),
+        )
+        self.assertIn("**[英语 → 简体中文]**", md_formatted)
+        self.assertIn("**词典释义**", md_formatted)
+        self.assertIn("- **发音**：英 `/rʌn/`  美 `/rʌn/`", md_formatted)
+        self.assertIn("- **v.** 跑，奔跑；运行", md_formatted)
+        self.assertIn("- **常见搭配**：`in the long run` (长远；终究)", md_formatted)
+        self.assertNotIn("Bing", md_formatted)
+
+        md_out = [
+            x
+            async for x in md_plugin.translate_command(
+                RichEvent("fy run", [Comp.Plain("/fy run")]),
+                GreedyStr("run"),
+            )
+        ]
+        self.assertIs(md_out[0].use_markdown_, True)
+
+        plain_out = [
+            x
+            async for x in plugin.translate_command(
+                RichEvent("fy run", [Comp.Plain("/fy run")]),
+                GreedyStr("run"),
+            )
+        ]
+        self.assertIs(plain_out[0].use_markdown_, False)
+
+        md_status = [
+            x
+            async for x in md_plugin.translate_command(
+                RichEvent("fy --status", [Comp.Plain("/fy --status")]),
+                GreedyStr("--status"),
+            )
+        ]
+        self.assertIn("**输出格式**：Markdown", md_status[0])
+        await md_plugin.terminate()
 
         # Help text also hides channel name
         out_help = [
