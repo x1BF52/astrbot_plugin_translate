@@ -1,0 +1,13 @@
+name: astrbot_plugin_translate
+display_name: 多引擎翻译插件
+short_desc: /fy、/翻译 多引擎翻译插件，内置常见免费 API 与自定义接口
+desc: 支持 /fy 与 /翻译 指令的多引擎翻译插件，内置多种常见免费翻译 API 选项并支持自定义接口与失败自动回退
+version: 1.0.0
+author: x1BF52
+repo: https://github.com/x1BF52/astrbot_plugin_translate
+category: utility
+social_link: https://github.com/x1BF52
+tags:
+  - translate
+  - 翻译
+  - utility

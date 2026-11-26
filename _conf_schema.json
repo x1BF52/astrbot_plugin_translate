@@ -1,0 +1,296 @@
+{
+  "api_provider": {
+    "description": "主翻译 API（预设常见免费接口 / 自定义）",
+    "type": "string",
+    "default": "bing_cn",
+    "obvious_hint": true,
+    "hint": "内置多个常见免费免密钥翻译 API（默认 Bing 国内直连），也可选择开源自建接口、OpenAI 兼容接口或 AstrBot 内置大模型。",
+    "options": [
+      "bing_cn",
+      "bing_global",
+      "youdao_web",
+      "mymemory",
+      "google_free",
+      "google_clients5",
+      "mozhi_adminforge",
+      "mozhi_aryak",
+      "mozhi_pussthecat",
+      "lingva_ml",
+      "libretranslate",
+      "deeplx",
+      "openai_compat",
+      "astrbot_llm",
+      "custom_http"
+    ],
+    "labels": [
+      "Bing 翻译（国内直连） - https://cn.bing.com/ttranslatev3",
+      "Bing 翻译（国际版） - https://www.bing.com/ttranslatev3",
+      "有道翻译（网页免费版） - https://m.youdao.com/translate",
+      "MyMemory 免费接口 - https://api.mymemory.translated.net/get",
+      "Google 翻译（GTX 免费接口） - https://translate.googleapis.com/translate_a/single",
+      "Google 翻译（Chrome 扩展接口） - https://clients5.google.com/translate_a/t",
+      "Mozhi 公共实例（AdminForge） - https://mozhi.adminforge.de/api/translate",
+      "Mozhi 公共实例（Aryak） - https://mozhi.aryak.me/api/translate",
+      "Mozhi 公共实例（PussTheCat） - https://mozhi.pussthecat.org/api/translate",
+      "Lingva 接口 - https://lingva.ml/api/v1",
+      "LibreTranslate 接口 - https://libretranslate.com/translate",
+      "DeepLX 接口 - http://127.0.0.1:1188/translate",
+      "OpenAI 兼容接口（自定义 URL / 免费 LLM API）",
+      "AstrBot 当前内置大模型（无需额外配置）",
+      "自定义 HTTP 翻译 API（通用模板）"
+    ],
+    "subtitles": [
+      "免费免密钥，国内可直接访问，支持自动检测语种与多行排版",
+      "免费免密钥，适合海外服务器或配置代理后使用",
+      "免费免密钥，国内直连稳定，支持中/英/日/韩/法/俄/西互译",
+      "免费公开 REST 接口，无需密钥（高频请求可能触发限流）",
+      "免费免密钥，海外直连或配合下方代理/自定义镜像地址使用",
+      "Google 备用免费接口，海外直连或配合代理/自定义镜像使用",
+      "开源多引擎隐私前端，免费免密钥（默认 duckduckgo 引擎）",
+      "开源多引擎隐私前端，免费免密钥（默认 yandex 引擎）",
+      "开源多引擎隐私前端，免费免密钥（默认 duckduckgo 引擎）",
+      "Google 翻译开源前端；公共实例易限流，建议在下方填写自建实例地址",
+      "开源机器翻译 API；官方站需填 API Key，自建或免密镜像可留空",
+      "DeepLX 兼容接口，需配合本地或自建 DeepLX 服务使用",
+      "兼容 SiliconFlow / DeepSeek / Groq / Ollama / GitHub Models 等接口",
+      "直接复用 AstrBot 主配置当前生效的对话 LLM 提供商",
+      "自由配置任意 GET/POST 翻译接口 URL、请求体模板与响应 JSON 路径"
+    ]
+  },
+  "custom_api_url": {
+    "description": "自定义 API 地址（可选，留空使用所选预设默认地址）",
+    "type": "string",
+    "default": "",
+    "hint": "填入完整 URL 可覆盖上方预设地址，例如自建镜像 https://your-lingva.example/api/v1、http://127.0.0.1:5000/translate、http://127.0.0.1:1188/translate 或 https://api.deepseek.com/v1/chat/completions。"
+  },
+  "api_key": {
+    "description": "API Key / 访问令牌（可选）",
+    "type": "string",
+    "default": "",
+    "secret": true,
+    "hint": "仅在使用需要鉴权的接口时填写（如官方 LibreTranslate、DeepLX Token、OpenAI 兼容接口或自定义模板 {{api_key}}）；Bing / 有道 / MyMemory / Google 免费接口留空即可。"
+  },
+  "default_target_lang": {
+    "description": "默认目标语言",
+    "type": "string",
+    "default": "auto_zh_en",
+    "options": [
+      "auto_zh_en",
+      "zh-CN",
+      "zh-TW",
+      "en",
+      "ja",
+      "ko",
+      "fr",
+      "de",
+      "es",
+      "ru"
+    ],
+    "labels": [
+      "智能中英互译（中文→英语，外文→简体中文）",
+      "简体中文 (zh-CN)",
+      "繁体中文 (zh-TW)",
+      "英语 (en)",
+      "日语 (ja)",
+      "韩语 (ko)",
+      "法语 (fr)",
+      "德语 (de)",
+      "西班牙语 (es)",
+      "俄语 (ru)"
+    ],
+    "subtitles": [
+      "推荐：中文自动翻成英文，其他语言自动翻成简体中文",
+      "始终默认翻译为简体中文",
+      "始终默认翻译为繁体中文",
+      "始终默认翻译为英语",
+      "始终默认翻译为日语",
+      "始终默认翻译为韩语",
+      "始终默认翻译为法语",
+      "始终默认翻译为德语",
+      "始终默认翻译为西班牙语",
+      "始终默认翻译为俄语"
+    ],
+    "hint": "指令中也可临时指定目标语言，例如：/fy ->ja 你好 或 /fy en->zh Hello。"
+  },
+  "enable_auto_fallback": {
+    "description": "主 API 失败时自动切换备用免费 API",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，当主翻译接口超时、限流或出错时，将依次尝试下方配置的备用接口。"
+  },
+  "fallback_providers": {
+    "description": "备用免费翻译 API 列表",
+    "type": "list",
+    "default": [
+      "youdao_web",
+      "mozhi_adminforge",
+      "mozhi_aryak",
+      "mymemory"
+    ],
+    "condition": {
+      "enable_auto_fallback": true
+    },
+    "options": [
+      "bing_cn",
+      "bing_global",
+      "youdao_web",
+      "mymemory",
+      "google_free",
+      "google_clients5",
+      "mozhi_adminforge",
+      "mozhi_aryak",
+      "mozhi_pussthecat",
+      "lingva_ml",
+      "astrbot_llm"
+    ],
+    "labels": [
+      "Bing（国内直连） - https://cn.bing.com/ttranslatev3",
+      "Bing（国际版） - https://www.bing.com/ttranslatev3",
+      "有道（网页免费版） - https://m.youdao.com/translate",
+      "MyMemory - https://api.mymemory.translated.net/get",
+      "Google（GTX） - https://translate.googleapis.com/translate_a/single",
+      "Google（Chrome 扩展） - https://clients5.google.com/translate_a/t",
+      "Mozhi（AdminForge） - https://mozhi.adminforge.de/api/translate",
+      "Mozhi（Aryak） - https://mozhi.aryak.me/api/translate",
+      "Mozhi（PussTheCat） - https://mozhi.pussthecat.org/api/translate",
+      "Lingva - https://lingva.ml/api/v1",
+      "AstrBot 当前内置大模型"
+    ],
+    "hint": "当主翻译 API 失败时按列表顺序依次兜底重试（会自动跳过当前主接口）。"
+  },
+  "proxy_url": {
+    "description": "HTTP 代理地址（可选）",
+    "type": "string",
+    "default": "",
+    "hint": "如需在受限网络下访问 Google / Lingva / 海外大模型接口，可填写 http://127.0.0.1:7890；留空则直连并遵循系统环境变量代理。"
+  },
+  "openai_model": {
+    "description": "OpenAI 兼容模型名称",
+    "type": "string",
+    "default": "gpt-4o-mini",
+    "condition": {
+      "api_provider": "openai_compat"
+    },
+    "hint": "填写对应服务商支持的模型 ID，例如 deepseek-chat、Qwen/Qwen2.5-7B-Instruct、llama-3.3-70b-versatile、gpt-4o-mini 等。"
+  },
+  "openai_system_prompt": {
+    "description": "大模型翻译系统提示词",
+    "type": "text",
+    "default": "You are a professional translator. Translate the user's text into {target_lang} accurately and naturally, preserving paragraph breaks and formatting. Output ONLY the translated text without explanations.",
+    "condition": {
+      "api_provider": "openai_compat"
+    },
+    "hint": "支持 {target_lang} 与 {source_lang} 占位符。"
+  },
+  "custom_http_method": {
+    "description": "自定义 HTTP 请求方法",
+    "type": "string",
+    "default": "POST",
+    "options": [
+      "POST",
+      "GET"
+    ],
+    "condition": {
+      "api_provider": "custom_http"
+    }
+  },
+  "custom_http_headers": {
+    "description": "自定义 HTTP 请求头 (JSON)",
+    "type": "text",
+    "default": "{\n  \"Content-Type\": \"application/json\"\n}",
+    "condition": {
+      "api_provider": "custom_http"
+    },
+    "hint": "JSON 对象格式，支持 {{api_key}} 占位符。"
+  },
+  "custom_http_body": {
+    "description": "自定义 HTTP 请求体模板 (POST 时生效)",
+    "type": "text",
+    "default": "{\n  \"q\": \"{{text}}\",\n  \"source\": \"{{source}}\",\n  \"target\": \"{{target}}\"\n}",
+    "condition": {
+      "api_provider": "custom_http"
+    },
+    "hint": "支持占位符 {{text}}、{{source}}、{{target}}、{{api_key}}；若为 GET 请求，请直接把占位符写在“自定义 API 地址”URL 中。"
+  },
+  "custom_http_response_path": {
+    "description": "自定义响应译文 JSON 提取路径",
+    "type": "string",
+    "default": "translatedText",
+    "condition": {
+      "api_provider": "custom_http"
+    },
+    "hint": "使用点号和下标访问 JSON 字段，例如 translatedText、data.text 或 translations.0.text。"
+  },
+  "advanced": {
+    "description": "高级设置",
+    "type": "object",
+    "collapsed": true,
+    "items": {
+      "mozhi_engine": {
+        "description": "Mozhi 后端引擎",
+        "type": "string",
+        "default": "auto",
+        "options": [
+          "auto",
+          "duckduckgo",
+          "yandex",
+          "google",
+          "deepl",
+          "libre",
+          "mymemory"
+        ],
+        "labels": [
+          "自动匹配推荐引擎",
+          "DuckDuckGo（微软内核）",
+          "Yandex",
+          "Google",
+          "DeepL",
+          "LibreTranslate",
+          "MyMemory"
+        ],
+        "hint": "auto 时 AdminForge / PussTheCat 实例默认使用 duckduckgo，Aryak 实例默认使用 yandex。"
+      },
+      "mymemory_email": {
+        "description": "MyMemory 邮箱参数（可选）",
+        "type": "string",
+        "default": "",
+        "hint": "可选填写有效邮箱（作为 MyMemory de 参数），有助于提升免费额度上限。"
+      },
+      "show_engine_name": {
+        "description": "在回复中显示翻译引擎",
+        "type": "bool",
+        "default": true
+      },
+      "show_detected_lang": {
+        "description": "在回复中显示语种方向",
+        "type": "bool",
+        "default": true
+      },
+      "show_original": {
+        "description": "同时附带原文",
+        "type": "bool",
+        "default": false
+      },
+      "timeout_seconds": {
+        "description": "单次请求超时时间（秒）",
+        "type": "int",
+        "default": 15,
+        "slider": {
+          "min": 5,
+          "max": 60,
+          "step": 1
+        }
+      },
+      "max_text_length": {
+        "description": "单次最大翻译字符数",
+        "type": "int",
+        "default": 3000,
+        "slider": {
+          "min": 200,
+          "max": 10000,
+          "step": 100
+        }
+      }
+    }
+  }
+}
