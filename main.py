@@ -88,6 +88,26 @@ class TranslatePlugin(Star):
         self._migrate_wake_settings()
         self._sync_command_filters()
 
+    @staticmethod
+    def _merge_default_triggers(
+        raw_value: Any,
+        defaults: tuple[str, ...],
+        *,
+        force_merge: bool,
+    ) -> list[str] | None:
+        """Return migrated trigger list if defaults should be backfilled/merged, else None."""
+        existing = parse_trigger_list(raw_value)
+        if not existing:
+            return list(defaults)
+        if force_merge:
+            merged = list(defaults)
+            for item in existing:
+                if item not in merged:
+                    merged.append(item)
+            if merged != existing:
+                return merged
+        return None
+
     def _migrate_wake_settings(self) -> None:
         """Migrate legacy empty wake lists and /fyai triggers once via wake_schema_version."""
         wake_cfg = self.config.get("wake_settings")
@@ -105,31 +125,18 @@ class TranslatePlugin(Star):
         legacy_enable = bool(wake_cfg.get("enable_default_fy", True))
 
         if version < 1 and (not has_legacy_flag or legacy_enable):
-            if "custom_wake_words" in wake_cfg:
-                existing_normal = parse_trigger_list(wake_cfg.get("custom_wake_words"))
-                if not existing_normal:
-                    wake_cfg["custom_wake_words"] = list(_DEFAULT_NORMAL_TRIGGERS)
-                    changed = True
-                elif has_legacy_flag and legacy_enable:
-                    merged_normal = list(_DEFAULT_NORMAL_TRIGGERS)
-                    for item in existing_normal:
-                        if item not in merged_normal:
-                            merged_normal.append(item)
-                    if merged_normal != existing_normal:
-                        wake_cfg["custom_wake_words"] = merged_normal
-                        changed = True
-            if "custom_ai_wake_words" in wake_cfg:
-                existing_ai = parse_trigger_list(wake_cfg.get("custom_ai_wake_words"))
-                if not existing_ai:
-                    wake_cfg["custom_ai_wake_words"] = list(_DEFAULT_AI_TRIGGERS)
-                    changed = True
-                elif has_legacy_flag and legacy_enable:
-                    merged_ai = list(_DEFAULT_AI_TRIGGERS)
-                    for item in existing_ai:
-                        if item not in merged_ai:
-                            merged_ai.append(item)
-                    if merged_ai != existing_ai:
-                        wake_cfg["custom_ai_wake_words"] = merged_ai
+            for key, defaults in (
+                ("custom_wake_words", _DEFAULT_NORMAL_TRIGGERS),
+                ("custom_ai_wake_words", _DEFAULT_AI_TRIGGERS),
+            ):
+                if key in wake_cfg:
+                    merged = self._merge_default_triggers(
+                        wake_cfg.get(key),
+                        defaults,
+                        force_merge=has_legacy_flag and legacy_enable,
+                    )
+                    if merged is not None:
+                        wake_cfg[key] = merged
                         changed = True
             if has_legacy_flag:
                 wake_cfg.pop("enable_default_fy", None)
@@ -143,11 +150,8 @@ class TranslatePlugin(Star):
                 token = str(item or "").strip()
                 if not token:
                     continue
-                if token.lower() == "/fyai":
-                    token = "/aify"
-                    ai_changed = True
-                elif token.lower() == "fyai":
-                    token = "aify"
+                if token.lower() in {"/fyai", "fyai"}:
+                    token = "/aify" if token.startswith("/") else "aify"
                     ai_changed = True
                 if token not in migrated_ai:
                     migrated_ai.append(token)
@@ -1039,34 +1043,33 @@ class TranslatePlugin(Star):
             else "已关闭"
         )
 
+        rows: list[tuple[str, str, bool]] = [
+            ("主接口", preset.name, False),
+            ("接口地址", active_url, True),
+            ("AI 提供商（/aify & 识图）", ai_prov_desc, True),
+            ("唤醒指令", wake_desc, False),
+            ("默认目标", target_desc, False),
+            ("图片翻译", img_status, False),
+            ("语音发音", voice_status, False),
+            ("输出格式", output_fmt, False),
+            ("备用回退", fallback_line, False),
+            ("代理模式", proxy, False),
+        ]
         if self._use_markdown():
+            body = "\n".join(
+                f"- **{k}**：`{v}`" if is_code else f"- **{k}**：{v}"
+                for k, v, is_code in rows
+            )
             return (
                 "**当前翻译配置状态**\n"
-                f"- **主接口**：{preset.name}\n"
-                f"- **接口地址**：`{active_url}`\n"
-                f"- **AI 提供商（/aify & 识图）**：`{ai_prov_desc}`\n"
-                f"- **唤醒指令**：{wake_desc}\n"
-                f"- **默认目标**：{target_desc}\n"
-                f"- **图片翻译**：{img_status}\n"
-                f"- **语音发音**：{voice_status}\n"
-                f"- **输出格式**：{output_fmt}\n"
-                f"- **备用回退**：{fallback_line}\n"
-                f"- **代理模式**：{proxy}\n\n"
+                f"{body}\n\n"
                 "提示：发送 `/fy --check` 可并发实测所有预设在当前网络下的可用性与延迟。\n"
                 "可在 AstrBot 管理面板「插件管理 -> 多引擎翻译插件 -> 配置」中修改。"
             )
+        body = "\n".join(f"• {k}：{v}" for k, v, _ in rows)
         return (
             "当前翻译配置状态：\n"
-            f"• 主接口：{preset.name}\n"
-            f"• 接口地址：{active_url}\n"
-            f"• AI 提供商（/aify & 识图）：{ai_prov_desc}\n"
-            f"• 唤醒指令：{wake_desc}\n"
-            f"• 默认目标：{target_desc}\n"
-            f"• 图片翻译：{img_status}\n"
-            f"• 语音发音：{voice_status}\n"
-            f"• 输出格式：{output_fmt}\n"
-            f"• 备用回退：{fallback_line}\n"
-            f"• 代理模式：{proxy}\n"
+            f"{body}\n"
             "提示：发送 /fy --check 可并发探活所有预设在当前网络下的可用性与延迟。\n"
             "可在 AstrBot 管理面板「插件管理 -> 多引擎翻译插件 -> 配置」中切换预设免费 API 或填写自定义接口。"
         )
@@ -1167,6 +1170,13 @@ class TranslatePlugin(Star):
             else:
                 lines.append("词典释义：")
                 lines.extend(res.dict_entries)
+        if res.low_confidence_hint:
+            lines.append("")
+            lines.append(
+                f"> 提示：{res.low_confidence_hint}"
+                if use_markdown
+                else f"提示：{res.low_confidence_hint}"
+            )
         return "\n".join(lines)
 
     async def _synthesize_voice_result(
@@ -1217,6 +1227,95 @@ class TranslatePlugin(Star):
             if explicit_voice:
                 return self._make_result(event, f"语音生成失败：{safe_msg}")
             return None
+
+    async def _run_image_translation(
+        self,
+        event: AstrMessageEvent,
+        *,
+        images: list[str],
+        content: str,
+        source_lang: str,
+        target_lang: str | None,
+    ) -> TranslationResult:
+        async def image_llm_cb(
+            prompt_txt: str,
+            sys_prompt: str,
+            img_urls: list[str],
+            provider_id_override: str = "",
+        ) -> str:
+            return await self._call_astrbot_image_llm(
+                event,
+                prompt_txt,
+                sys_prompt,
+                img_urls,
+                provider_id_override=provider_id_override,
+            )
+
+        return await self._service.translate_images(
+            image_urls=images,
+            user_text=content,
+            config=self.config,
+            source_lang=source_lang,
+            target_lang=target_lang,
+            astrbot_image_callback=image_llm_cb,
+        )
+
+    async def _run_text_translation(
+        self,
+        event: AstrMessageEvent,
+        *,
+        content: str,
+        source_lang: str,
+        target_lang: str | None,
+        force_ai: bool,
+    ) -> TranslationResult:
+        provider_override: str | None = None
+        if force_ai:
+            ai_choice = resolve_ai_provider_choice(self.config)
+            provider_override = (
+                "openai_compat"
+                if ai_choice.lower() in {"openai_compat", "openai"}
+                else "astrbot_llm"
+            )
+
+        async def llm_cb(
+            txt: str,
+            src_lbl: str,
+            tgt_lbl: str,
+            dict_mode: bool = False,
+        ) -> str:
+            return await self._call_astrbot_llm(
+                event, txt, src_lbl, tgt_lbl, dict_mode=dict_mode
+            )
+
+        try:
+            return await self._service.translate(
+                text=content,
+                config=self.config,
+                source_lang=source_lang,
+                target_lang=target_lang,
+                llm_callback=llm_cb,
+                provider_override=provider_override,
+            )
+        except TranslationError as ai_exc:
+            plugin_llm_key = str(self.config.get("api_provider") or "")
+            if (
+                force_ai
+                and provider_override == "astrbot_llm"
+                and not resolve_ai_provider_choice(self.config)
+                and plugin_llm_key
+                in {"openai_compat", "zhipu_free", "siliconflow_free", "groq_free"}
+                and "未配置可用的大模型提供商" in str(ai_exc)
+            ):
+                return await self._service.translate(
+                    text=content,
+                    config=self.config,
+                    source_lang=source_lang,
+                    target_lang=target_lang,
+                    llm_callback=llm_cb,
+                    provider_override=plugin_llm_key,
+                )
+            raise
 
     async def _execute_translate(
         self,
@@ -1282,76 +1381,21 @@ class TranslatePlugin(Star):
         op_label = "图片翻译" if images else ("AI 翻译" if force_ai else "翻译")
         try:
             if images:
-                async def image_llm_cb(
-                    prompt_txt: str,
-                    sys_prompt: str,
-                    img_urls: list[str],
-                    provider_id_override: str = "",
-                ) -> str:
-                    return await self._call_astrbot_image_llm(
-                        event,
-                        prompt_txt,
-                        sys_prompt,
-                        img_urls,
-                        provider_id_override=provider_id_override,
-                    )
-
-                result = await self._service.translate_images(
-                    image_urls=images,
-                    user_text=content,
-                    config=self.config,
+                result = await self._run_image_translation(
+                    event,
+                    images=images,
+                    content=content,
                     source_lang=parsed.source_lang,
                     target_lang=parsed.target_lang,
-                    astrbot_image_callback=image_llm_cb,
                 )
             else:
-                provider_override: str | None = None
-                if force_ai:
-                    ai_choice = resolve_ai_provider_choice(self.config)
-                    provider_override = (
-                        "openai_compat"
-                        if ai_choice.lower() in {"openai_compat", "openai"}
-                        else "astrbot_llm"
-                    )
-
-                async def llm_cb(
-                    txt: str,
-                    src_lbl: str,
-                    tgt_lbl: str,
-                    dict_mode: bool = False,
-                ) -> str:
-                    return await self._call_astrbot_llm(
-                        event, txt, src_lbl, tgt_lbl, dict_mode=dict_mode
-                    )
-
-                try:
-                    result = await self._service.translate(
-                        text=content,
-                        config=self.config,
-                        source_lang=parsed.source_lang,
-                        target_lang=parsed.target_lang,
-                        llm_callback=llm_cb,
-                        provider_override=provider_override,
-                    )
-                except TranslationError as ai_exc:
-                    plugin_llm_key = str(self.config.get("api_provider") or "")
-                    if (
-                        force_ai
-                        and provider_override == "astrbot_llm"
-                        and not resolve_ai_provider_choice(self.config)
-                        and plugin_llm_key in {"openai_compat", "zhipu_free", "siliconflow_free", "groq_free"}
-                        and "未配置可用的大模型提供商" in str(ai_exc)
-                    ):
-                        result = await self._service.translate(
-                            text=content,
-                            config=self.config,
-                            source_lang=parsed.source_lang,
-                            target_lang=parsed.target_lang,
-                            llm_callback=llm_cb,
-                            provider_override=plugin_llm_key,
-                        )
-                    else:
-                        raise
+                result = await self._run_text_translation(
+                    event,
+                    content=content,
+                    source_lang=parsed.source_lang,
+                    target_lang=parsed.target_lang,
+                    force_ai=force_ai,
+                )
         except TranslationError as exc:
             safe_msg = redact_config_secrets(str(exc), self.config)
             logger.warning("%s失败: %s", op_label, safe_msg)

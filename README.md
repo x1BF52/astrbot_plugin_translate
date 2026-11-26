@@ -12,23 +12,24 @@ AstrBot 多引擎翻译插件，使用 `/fy` 或 `/翻译` 指令触发翻译。
 - **混合语种/双行对照防串扰**：遇到“日文汉字地址 + 罗马音”或“外文 + 英文”等多行混合文本时，自动按语种分块独立翻译再重组，避免混合输出残缺汉字或未译罗马音；并增强了日语新字体（如 `県`、`栄`、`駅`）与邮政符号 `〒` 的识别。
 - **图片 OCR 识图翻译**：发送图片并输入 `/fy` / `/aify`（或引用含图消息）时，自动调用配置的 AI 提供商识别图内文字并翻译（支持同时附带目标语或补充指令，如 `/fy 日语`、`/fy 提取菜单价格`）。
 - **外语发音语音（云端 TTS）**：在指令中附带语音触发词（默认 `-v` / `--voice` / `--tts` / `--say`，可在「语音发音设置 -> 语音触发词」列表中自由增删修改，如改为 `-y`、`语音`、`朗读` 等；示例 `/fy -v apple`、`/fy 日语 -v 你好`）可同时返回云端合成的读音语音；内置免密直连 Bing 微软云端神经语音（60+ 语种）、有道云端语音、Google 云端语音及 AstrBot 内置 TTS 回退，智能选择外语朗读（外译中朗读外语原文，中译外朗读外语译文）。注：AstrBot 发送原生语音条内部需 `ffmpeg` 将云端 MP3 转为 WAV/SILK，环境无 `ffmpeg` 时会自动降级发送 MP3 音频文件。
-- **智能中英互译**：默认模式下，中文自动翻译为英语，外文自动翻译为简体中文。
+- **智能中英互译与低置信度提示**：默认模式下，中文自动翻译为英语，外文自动翻译为简体中文；遇到纯共通汉字（如 `株式会社`、`東京大学`，不含假名/日语新字体/简体专字）或不支持自动检测接口上的歧义拉丁文时，会自动提示使用 `/fy ja->zh <文本>`、`/fy fr->zh <文本>` 手动锁定源语言。
 - **多种目标语指定方式**：
   - `/fy 日语 你好` 或 `/翻译 英语 今天天气不错`
-  - `/fy ->ja 你好` 或 `/fy en->zh Hello`
+  - `/fy ->ja 你好` 或 `/fy en->zh Hello`（支持显式锁定源语言，如 `/fy ja->zh 株式会社`）
   - `/fy ja: 你好` 或 `/fy -t ko 你好`
 - **引用消息翻译**：回复/引用任意文本或图片消息并发送 `/fy`、`/翻译` 或 `/fy en` 即可翻译被引用消息的内容。
-- **失败自动回退**：主 API 超时、限流或返回异常时，按备用列表顺序自动重试其他免费接口。
+- **预设并发探活（`/fy --check`）**：一键并发实测当前部署网络下所有免密预设的连通性与延迟（同时区分需 Key / 自建 / 内置模型），方便直接挑选最稳最快的接口。
+- **长文本分段、短时缓存与可靠回退**：超长文本按各引擎单次字符上限自动分段翻译并拼接；内置短时防抖缓存（按「原文 + 源语 + 目标语 + 引擎 + 词典模式 + 配置」复合 Key 隔离，不同语种绝不串缓存）；主 API 超时、限流或免费额度耗尽（如 MyMemory 每日限额）时自动切换备用引擎，并受「回退链总超时上限」保护，不会无限卡死。
 
 ## 内置 API 预设
 
 ### 1. 免密钥直连免费接口（开箱即用）
 - **Bing 翻译（国内直连 / 国际版）**：`https://cn.bing.com/ttranslatev3`（默认）、`https://www.bing.com/ttranslatev3`
 - **有道翻译（网页免费版）**：`https://m.youdao.com/translate`
-- **Mozhi 公共实例**：`https://mozhi.adminforge.de/api/translate`、`https://mozhi.aryak.me/api/translate`、`https://mozhi.pussthecat.org/api/translate`
-- **MyMemory 免费接口**：`https://api.mymemory.translated.net/get`
+- **Mozhi 公共实例（实验性）**：`https://mozhi.adminforge.de/api/translate`、`https://mozhi.aryak.me/api/translate`、`https://mozhi.pussthecat.org/api/translate`（海外公共实例，稳定性视网络而定）
+- **MyMemory 免费接口**：`https://api.mymemory.translated.net/get`（单次自动按 450 字分段，每日免费额度用尽时自动回退下一个引擎）
 - **Google 翻译（GTX / Chrome 扩展接口）**：`https://translate.googleapis.com/translate_a/single`、`https://clients5.google.com/translate_a/t`
-- **Lingva 接口**：`https://lingva.ml/api/v1`（公共实例易限流，可在配置页覆盖为自建地址）
+- **Lingva 接口（实验性）**：`https://lingva.ml/api/v1`（公共实例易限流，建议在配置页覆盖为自建地址）
 
 ### 2. 免费大模型 & 开放平台预设（填写对应平台免费 Key 即可用）
 - **智谱 AI（`zhipu_free`）**：`https://open.bigmodel.cn/api/paas/v4/chat/completions`，默认免费模型 `GLM-4-Flash-250414`（亦可选 `GLM-4.7-Flash`）

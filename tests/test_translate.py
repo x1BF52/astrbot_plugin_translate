@@ -1750,12 +1750,19 @@ class ServiceAndPluginMockTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(p_off.text, "-v apple")
 
     async def test_cache_key_isolation_timeout_budget_quota_fallback_and_probe(self):
-        # 1. European Latin diacritic detection
-        self.assertEqual(translator.detect_script_lang("Überraschung Straße"), "de")
-        self.assertEqual(translator.detect_script_lang("¿Cómo estás mañana?"), "es")
-        self.assertEqual(translator.detect_script_lang("Ação e coração"), "pt")
-        self.assertEqual(translator.detect_script_lang("Bonjour, ça va très bien"), "fr")
-        self.assertEqual(translator.detect_script_lang("Hello world"), "en")
+        # 1. Language detection with confidence (CJK ambiguity & overlapping Latin accents)
+        self.assertEqual(translator.detect_script_lang_with_confidence("Überraschung Straße"), ("de", "high"))
+        self.assertEqual(translator.detect_script_lang_with_confidence("¿Cómo estás mañana?"), ("es", "high"))
+        self.assertEqual(translator.detect_script_lang_with_confidence("Ação e coração"), ("pt", "high"))
+        self.assertEqual(translator.detect_script_lang_with_confidence("Bonjour, ça va très bien"), ("fr", "high"))
+        # Lone 'é' overlaps with es/pt/it, so must NOT be over-weighted as high-confidence French
+        self.assertEqual(translator.detect_script_lang_with_confidence("café"), ("en", "low"))
+        self.assertEqual(translator.detect_script_lang_with_confidence("Hello world"), ("en", "low"))
+        # Pure shared Kanji/Hanzi vs Simplified Chinese vs Japanese Kana/Shinjitai
+        self.assertEqual(translator.detect_script_lang_with_confidence("株式会社"), ("zh-CN", "low"))
+        self.assertEqual(translator.detect_script_lang_with_confidence("这个问题怎么解决"), ("zh-CN", "high"))
+        self.assertEqual(translator.detect_script_lang_with_confidence("富山県"), ("ja", "high"))
+        self.assertEqual(translator.detect_script_lang_with_confidence("ありがとう"), ("ja", "high"))
 
         # 2. Composite cache key: same text with different target/source/engine must NOT collide
         req_count = 0
@@ -1865,6 +1872,36 @@ class ServiceAndPluginMockTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("youdao_web", out_check[0])
         self.assertIn("zhipu_free", out_check[0])
         self.assertIn("astrbot_llm", out_check[0])
+
+        # 6. Low-confidence hint shown for pure shared Kanji in auto mode, silent when locked
+        out_ambig = [
+            x
+            async for x in plugin.translate_command(
+                AstrMessageEvent("fy 株式会社", [Comp.Plain("/fy 株式会社")]),
+                GreedyStr("株式会社"),
+            )
+        ]
+        self.assertIn("纯汉字", out_ambig[0])
+        self.assertIn("ja->zh", out_ambig[0])
+
+        out_locked = [
+            x
+            async for x in plugin.translate_command(
+                AstrMessageEvent("fy ja->zh 株式会社", [Comp.Plain("/fy ja->zh 株式会社")]),
+                GreedyStr("ja->zh 株式会社"),
+            )
+        ]
+        self.assertNotIn("纯汉字", out_locked[0])
+
+        out_high_zh = [
+            x
+            async for x in plugin.translate_command(
+                AstrMessageEvent("fy 这个问题怎么解决", [Comp.Plain("/fy 这个问题怎么解决")]),
+                GreedyStr("这个问题怎么解决"),
+            )
+        ]
+        self.assertNotIn("纯汉字", out_high_zh[0])
+
         await plugin.terminate()
 
 

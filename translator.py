@@ -713,6 +713,7 @@ class TranslationResult:
     fallback_used: bool = False
     errors: list[str] | None = None
     dict_entries: list[str] | None = None
+    low_confidence_hint: str = ""
 
 
 @dataclass
@@ -761,10 +762,18 @@ _THAI_PATTERN = re.compile(r"[\u0e00-\u0e7f]")
 _LATIN_PATTERN = re.compile(r"[A-Za-z\u00c0-\u024f]")
 # Strictly Japanese Shinjitai characters not used in standard Simplified or Traditional Chinese.
 _JA_SHINJITAI_PATTERN = re.compile(r"[県駅気庁図広桜沢渋売乗変伝仮価薬観読続仏検営関栄転]")
-_DE_DIACRITIC_PATTERN = re.compile(r"[äöüßÄÖÜ]")
-_ES_DIACRITIC_PATTERN = re.compile(r"[ñÑ¿¡]")
-_PT_DIACRITIC_PATTERN = re.compile(r"[ãõÃÕ]")
-_FR_DIACRITIC_PATTERN = re.compile(r"[œŒçÇéèêëàùâîôûÉÈÊËÀÙÂÎÔÛ]")
+# High-frequency Simplified Chinese characters absent from Japanese Joyo Kanji.
+_ZH_SIMPLIFIED_ONLY_PATTERN = re.compile(
+    r"[这们为说时发个动过对还让给么吗呢啊吧从进现开关车长门问间马鸟鱼龙风电飞书习买红绿蓝银钱铁钟产经务实华]"
+)
+_DE_STRONG_PATTERN = re.compile(r"[ß]")
+_DE_UMLAUT_PATTERN = re.compile(r"[äöüÄÖÜ]")
+_ES_STRONG_PATTERN = re.compile(r"[ñÑ¿¡]")
+_PT_STRONG_PATTERN = re.compile(r"[ãõÃÕ]")
+# Excludes lone 'é'/'à' which overlap heavily with Spanish, Portuguese, and Italian.
+_FR_STRONG_PATTERN = re.compile(r"[œŒèêëâîôûùÈÊËÂÎÔÛÙ]")
+_FR_CEDILLA_PATTERN = re.compile(r"[çÇ]")
+_LATIN_OVERLAP_ACCENT_PATTERN = re.compile(r"[éáíóúàìòÉÁÍÓÚÀÌÒ]")
 DEFAULT_VOICE_FLAGS: tuple[str, ...] = ("-v", "--voice", "--tts", "--say")
 _VOICE_FLAG_PATTERN = re.compile(
     r"^(?:--say|--tts|--voice|-v)(?:$|[\s\r\n]+([\s\S]*))$",
@@ -803,33 +812,49 @@ def _has_japanese_marker(text: str, han_count: int, latin_count: int) -> bool:
     return has_shinjitai_or_postal and (latin_count == 0 or han_count * 2 >= latin_count)
 
 
-def detect_script_lang(text: str) -> str:
-    """Heuristically detect primary script language when an API requires an explicit source."""
+def detect_script_lang_with_confidence(text: str) -> tuple[str, str]:
+    """Detect primary script language with confidence ('high' or 'low').
+
+    Pure shared CJK Kanji/Hanzi (no Kana, no Shinjitai, no Simplified-only chars)
+    and plain ASCII / overlapping-accent Latin return 'low' confidence so callers
+    can warn users to lock the source language explicitly when needed.
+    """
     if not text:
-        return "en"
+        return "en", "low"
     han_count = len(_HAN_PATTERN.findall(text))
     latin_count = len(_LATIN_PATTERN.findall(text))
     if _has_japanese_marker(text, han_count, latin_count):
-        return "ja"
+        return "ja", "high"
     if _KO_HANGUL_PATTERN.search(text):
-        return "ko"
+        return "ko", "high"
     if han_count > 0 and (latin_count == 0 or han_count * 2 >= latin_count):
-        return "zh-CN"
+        if _ZH_SIMPLIFIED_ONLY_PATTERN.search(text):
+            return "zh-CN", "high"
+        return "zh-CN", "low"
     if _CYRILLIC_PATTERN.search(text):
-        return "ru"
+        return "ru", "high"
     if _ARABIC_PATTERN.search(text):
-        return "ar"
+        return "ar", "high"
     if _THAI_PATTERN.search(text):
-        return "th"
-    if _ES_DIACRITIC_PATTERN.search(text):
-        return "es"
-    if _PT_DIACRITIC_PATTERN.search(text):
-        return "pt"
-    if _DE_DIACRITIC_PATTERN.search(text):
-        return "de"
-    if _FR_DIACRITIC_PATTERN.search(text):
-        return "fr"
-    return "en"
+        return "th", "high"
+    if _ES_STRONG_PATTERN.search(text):
+        return "es", "high"
+    if _PT_STRONG_PATTERN.search(text):
+        return "pt", "high"
+    if _DE_STRONG_PATTERN.search(text) or _DE_UMLAUT_PATTERN.search(text):
+        return "de", "high"
+    if _FR_STRONG_PATTERN.search(text):
+        return "fr", "high"
+    if _FR_CEDILLA_PATTERN.search(text):
+        return "fr", "low"
+    if _LATIN_OVERLAP_ACCENT_PATTERN.search(text):
+        return "en", "low"
+    return "en", "low"
+
+
+def detect_script_lang(text: str) -> str:
+    """Heuristically detect primary script language when an API requires an explicit source."""
+    return detect_script_lang_with_confidence(text)[0]
 
 
 def _classify_line_script(line: str) -> str:
@@ -1512,6 +1537,7 @@ class TranslationService:
             fallback_used=cached_res.fallback_used,
             errors=list(cached_res.errors) if cached_res.errors else None,
             dict_entries=list(cached_res.dict_entries) if cached_res.dict_entries else None,
+            low_confidence_hint=cached_res.low_confidence_hint,
         )
 
     def _cache_put(self, key: tuple[Any, ...], result: TranslationResult) -> None:
@@ -1667,6 +1693,26 @@ class TranslationService:
                     config=config,
                     prefetched_youdao=prefetched_yd,
                 ) or None
+            low_conf_hint = ""
+            if source_lang == "auto":
+                local_lang, local_conf = detect_script_lang_with_confidence(text)
+                if local_conf == "low":
+                    if (
+                        local_lang == "zh-CN"
+                        and target_lang is None
+                        and default_target == "auto_zh_en"
+                    ):
+                        low_conf_hint = (
+                            "纯汉字在自动模式下可能存在中日歧义，如需指定源语言可使用 /fy ja->zh <文本>"
+                        )
+                    elif preset.kind in {"mymemory", "youdao_web"} and (
+                        _LATIN_OVERLAP_ACCENT_PATTERN.search(text)
+                        or _FR_CEDILLA_PATTERN.search(text)
+                    ):
+                        low_conf_hint = (
+                            "当前接口无法自动区分拉丁语种，如需精确翻译可使用 /fy fr->zh 或 /fy es->zh <文本>"
+                        )
+
             return TranslationResult(
                 translated_text=cleaned,
                 provider_key=preset.key,
@@ -1677,6 +1723,7 @@ class TranslationService:
                 fallback_used=(idx > 0),
                 errors=errors or None,
                 dict_entries=dict_entries,
+                low_confidence_hint=low_conf_hint,
             )
 
         errors: list[str] = []
