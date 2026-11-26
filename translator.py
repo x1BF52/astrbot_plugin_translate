@@ -1502,12 +1502,14 @@ class TranslationService:
     ) -> tuple[Any, ...]:
         """Build a composite cache key: text + source + target + engine + config discriminator."""
         adv = config.get("advanced") or {}
+        use_markdown = bool(adv.get("output_markdown", False))
         if engine_key == "astrbot_llm":
-            variant = resolve_ai_provider_choice(config)
+            variant: Any = (resolve_ai_provider_choice(config), use_markdown)
         else:
             variant = (
                 str(config.get("custom_api_url") or "").strip(),
                 str(adv.get("llm_model") or "").strip(),
+                use_markdown,
             )
         return (
             text.strip(),

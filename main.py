@@ -1131,12 +1131,51 @@ class TranslatePlugin(Star):
             lines.append(f"建议主接口优先选用当前延迟最低的 {ok_list[0].name} ({ok_list[0].key}，{ok_list[0].detail})。")
         return "\n".join(lines)
 
+    @staticmethod
+    def _format_markdown_result(text: str) -> str:
+        """Bold translated text in Markdown mode without breaking existing Markdown blocks."""
+        stripped = text.strip()
+        if not stripped:
+            return text
+        lines = stripped.splitlines()
+        has_md = (
+            "**" in stripped
+            or "```" in stripped
+            or any(
+                re.match(r"^\s*(?:#{1,6}\s|[-*+]\s|\d+\.\s|>\s)", ln)
+                for ln in lines
+            )
+        )
+        if not has_md:
+            return "\n".join(f"**{ln}**" if ln.strip() else "" for ln in lines)
+
+        out: list[str] = []
+        bolded_lead = False
+        for ln in lines:
+            if (
+                not bolded_lead
+                and ln.strip()
+                and "**" not in ln
+                and not re.match(r"^\s*(?:#{1,6}\s|[-*+]\s|\d+\.\s|>\s|`)", ln)
+            ):
+                out.append(f"**{ln.strip()}**")
+                bolded_lead = True
+            else:
+                out.append(ln)
+        return "\n".join(out)
+
     def _format_output(self, original: str, res: TranslationResult) -> str:
         adv = self.config.get("advanced") or {}
         show_engine = adv.get("show_engine_name", False)
         show_lang = adv.get("show_detected_lang", True)
         show_original = adv.get("show_original", False)
         use_markdown = self._use_markdown()
+
+        lines: list[str] = [
+            self._format_markdown_result(res.translated_text)
+            if use_markdown
+            else res.translated_text
+        ]
 
         meta_parts: list[str] = []
         if show_lang:
@@ -1149,19 +1188,13 @@ class TranslatePlugin(Star):
         if show_engine:
             suffix = "（备用回退）" if res.fallback_used else ""
             meta_parts.append(f"{res.provider_name}{suffix}")
-
-        lines: list[str] = []
         if meta_parts:
-            header = f"[{' | '.join(meta_parts)}]"
-            lines.append(f"**{header}**" if use_markdown else header)
+            lines.append(f"[{' | '.join(meta_parts)}]")
+
         if show_original and original.strip():
-            if use_markdown:
-                lines.append(f"**原文：**\n{original}\n\n**译文：**\n{res.translated_text}")
-            else:
-                lines.append(f"原文：{original}")
-                lines.append(f"译文：{res.translated_text}")
-        else:
-            lines.append(res.translated_text)
+            lines.append(
+                f"**原文**：{original}" if use_markdown else f"原文：{original}"
+            )
         if res.dict_entries:
             lines.append("")
             if use_markdown:

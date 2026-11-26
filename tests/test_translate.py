@@ -1043,7 +1043,7 @@ class ServiceAndPluginMockTests(unittest.IsolatedAsyncioTestCase):
                 dict_entries=["英 /rʌn/", "• v. 跑，奔跑；运行", "• n. 跑步；旅程"],
             ),
         )
-        self.assertIn("[英语 → 简体中文]", formatted)
+        self.assertTrue(formatted.startswith("跑\n[英语 → 简体中文]"))
         self.assertIn("词典释义：", formatted)
         self.assertIn("• v. 跑，奔跑；运行", formatted)
         self.assertNotIn("Bing", formatted)
@@ -1108,12 +1108,38 @@ class ServiceAndPluginMockTests(unittest.IsolatedAsyncioTestCase):
                 ],
             ),
         )
-        self.assertIn("**[英语 → 简体中文]**", md_formatted)
+        self.assertTrue(md_formatted.startswith("**跑**\n[英语 → 简体中文]\n**原文**：run"))
+        self.assertNotIn("**[英语 → 简体中文]**", md_formatted)
         self.assertIn("**词典释义**", md_formatted)
         self.assertIn("- **发音**：英 `/rʌn/`  美 `/rʌn/`", md_formatted)
         self.assertIn("- **v.** 跑，奔跑；运行", md_formatted)
         self.assertIn("- **常见搭配**：`in the long run` (长远；终究)", md_formatted)
         self.assertNotIn("Bing", md_formatted)
+
+        # Multi-line plain translation bolds each line cleanly; pre-formatted Markdown is not broken
+        md_multi = md_plugin._format_output(
+            "a\nb",
+            translator.TranslationResult(
+                translated_text="甲\n乙",
+                provider_key="bing_cn",
+                provider_name="Bing",
+                source_lang="en",
+                target_lang="zh-CN",
+            ),
+        )
+        self.assertTrue(md_multi.startswith("**甲**\n**乙**\n[英语 → 简体中文]"))
+
+        md_preformatted = md_plugin._format_output(
+            "run",
+            translator.TranslationResult(
+                translated_text="跑\n- **v.** 奔跑",
+                provider_key="astrbot_llm",
+                provider_name="AstrBot",
+                source_lang="en",
+                target_lang="zh-CN",
+            ),
+        )
+        self.assertTrue(md_preformatted.startswith("**跑**\n- **v.** 奔跑\n[英语 → 简体中文]"))
 
         md_out = [
             x
