@@ -385,10 +385,31 @@ class ServiceAndPluginMockTests(unittest.IsolatedAsyncioTestCase):
                 if bing_calls["post"] == 1:
                     return MockResponse(200, {"statusCode": 401})
                 txt = kw["data"]["text"]
-                det = "zh-Hans" if txt == "矛盾" else "en"
+                from_lang = kw["data"].get("fromLang", "auto-detect")
+                if txt == "instant":
+                    # Simulate real Bing behavior: cn.bing.com detects "instant" as "fr"
+                    # even when fromLang="en" is explicitly sent.
+                    text_out = "瞬间的" if from_lang == "auto-detect" else "瞬间"
+                    det = "fr"
+                elif txt == "gift":
+                    if from_lang == "en":
+                        text_out = "礼物"
+                        det = "en"
+                    else:
+                        text_out = "毒药"
+                        det = "de"
+                elif txt == "bonjour":
+                    text_out = "你好"
+                    det = "fr"
+                elif txt == "矛盾":
+                    text_out = f"BING:{txt}"
+                    det = "zh-Hans"
+                else:
+                    text_out = f"BING:{txt}"
+                    det = "en"
                 return MockResponse(
                     200,
-                    [{"translations": [{"text": f"BING:{txt}"}], "detectedLanguage": {"language": det}}],
+                    [{"translations": [{"text": text_out}], "detectedLanguage": {"language": det}}],
                 )
             if "cn.bing.com:8443/tlookupv3" in url:
                 return MockResponse(
@@ -405,6 +426,78 @@ class ServiceAndPluginMockTests(unittest.IsolatedAsyncioTestCase):
                     ],
                 )
             if "dict.youdao.com/jsonapi" in url:
+                q = kw.get("params", {}).get("q", "")
+                if q == "instant":
+                    return MockResponse(
+                        200,
+                        {
+                            "ec": {
+                                "exam_type": ["CET4", "CET6", "IELTS"],
+                                "word": [
+                                    {
+                                        "ukphone": "ˈɪnstənt",
+                                        "usphone": "ˈɪnstənt",
+                                        "trs": [
+                                            {"tr": [{"l": {"i": ["adj. 立即的；紧迫的；速溶的"]}}]},
+                                            {"tr": [{"l": {"i": ["n. 瞬间，片刻；咖啡"]}}]},
+                                        ],
+                                    }
+                                ],
+                            },
+                            "fc": {
+                                "word": [
+                                    {
+                                        "phone": "ɛ̃stɑ̃, ɑ̃:t",
+                                        "trs": [{"tr": [{"l": {"i": ["[m.] 瞬间，片刻"]}}]}],
+                                    }
+                                ]
+                            },
+                        },
+                    )
+                if q == "gift":
+                    return MockResponse(
+                        200,
+                        {
+                            "ec": {
+                                "exam_type": ["CET4"],
+                                "word": [
+                                    {
+                                        "ukphone": "ɡɪft",
+                                        "usphone": "ɡɪft",
+                                        "trs": [
+                                            {"tr": [{"l": {"i": ["n. 礼物，赠品；天赋"]}}]},
+                                            {"tr": [{"l": {"i": ["v. 赠送；赋予"]}}]},
+                                        ],
+                                    }
+                                ],
+                            }
+                        },
+                    )
+                if q == "bonjour":
+                    return MockResponse(
+                        200,
+                        {
+                            "ec": {
+                                "word": [
+                                    {
+                                        "trs": [
+                                            {"tr": [{"l": {"i": ["int. （法）你好，早安"]}}]},
+                                        ]
+                                    }
+                                ]
+                            },
+                            "fc": {
+                                "word": [
+                                    {
+                                        "phone": "bɔ̃ʒu:r",
+                                        "trs": [
+                                            {"tr": [{"l": {"i": ["[法语] 你好，早安"]}}]},
+                                        ],
+                                    }
+                                ]
+                            },
+                        },
+                    )
                 return MockResponse(
                     200,
                     {
@@ -536,6 +629,35 @@ class ServiceAndPluginMockTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("n. contradiction；conflict", joined_zh_dict)
         self.assertIn("adj. contradictory", joined_zh_dict)
         self.assertIn("v. contradict", joined_zh_dict)
+
+        # Ambiguous ASCII English word misdetected as French by Bing ("instant")
+        res_instant = await svc.translate(
+            "instant",
+            {"api_provider": "bing_cn", "enable_auto_fallback": False},
+        )
+        self.assertEqual(res_instant.detected_lang, "en")
+        self.assertEqual(res_instant.translated_text, "瞬间")
+        joined_instant_dict = "\n".join(res_instant.dict_entries or [])
+        self.assertIn("英 /ˈɪnstənt/", joined_instant_dict)
+        self.assertNotIn("ɛ̃stɑ̃", joined_instant_dict)
+
+        # False friend misdetected as German ("gift" -> "毒药") must re-translate as English ("礼物")
+        res_gift = await svc.translate(
+            "gift",
+            {"api_provider": "bing_cn", "enable_auto_fallback": False},
+        )
+        self.assertEqual(res_gift.detected_lang, "en")
+        self.assertEqual(res_gift.translated_text, "礼物")
+
+        # Real French loanword ("bonjour") must remain detected as French
+        res_bonjour = await svc.translate(
+            "bonjour",
+            {"api_provider": "bing_cn", "enable_auto_fallback": False},
+        )
+        self.assertEqual(res_bonjour.detected_lang, "fr")
+        self.assertEqual(res_bonjour.translated_text, "你好")
+        joined_bonjour_dict = "\n".join(res_bonjour.dict_entries or [])
+        self.assertIn("bɔ̃ʒu:r", joined_bonjour_dict)
 
         # New LLM presets + dictionary mode vs sentence mode
         self.assertEqual(
@@ -729,6 +851,22 @@ class ServiceAndPluginMockTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("词典释义：", formatted)
         self.assertIn("• v. 跑，奔跑；运行", formatted)
         self.assertNotIn("Bing", formatted)
+
+        # Explicit source_lang="en" overrides Bing's erroneous detected_lang="fr" in header
+        formatted_explicit_en = plugin._format_output(
+            "instant",
+            translator.TranslationResult(
+                translated_text="瞬间",
+                provider_key="bing_cn",
+                provider_name="Bing 翻译 (国内版)",
+                source_lang="en",
+                target_lang="zh-CN",
+                detected_lang="fr",
+                dict_entries=["英 /ˈɪnstənt/", "• adj. 立即的"],
+            ),
+        )
+        self.assertIn("[英语 → 简体中文]", formatted_explicit_en)
+        self.assertNotIn("法语", formatted_explicit_en)
 
         # Markdown mode formatting and MessageEventResult.use_markdown(True/False)
         class RichResult(str):
@@ -945,6 +1083,8 @@ class LiveBackendTests(unittest.IsolatedAsyncioTestCase):
             ("bing_cn", "Hello world!\nGood morning, everyone.", None, False),
             ("bing_cn", "今天天气真好，我们去散步吧。", "ja", False),
             ("bing_cn", "run", None, True),
+            ("bing_cn", "instant", None, True),
+            ("bing_cn", "bonjour", None, True),
             ("bing_cn", "矛盾", None, True),
             ("bing_cn", "食べる", None, True),
             ("youdao_web", "look up", None, True),
@@ -966,6 +1106,14 @@ class LiveBackendTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(res.translated_text.strip(), provider_key)
                 if expect_dict:
                     self.assertTrue(res.dict_entries, f"Expected dict_entries for {text!r}")
+                if text == "instant":
+                    self.assertEqual(res.detected_lang, "en")
+                    self.assertTrue(
+                        any("英 /" in line for line in (res.dict_entries or [])),
+                        f"Expected English phonetics for 'instant', got: {res.dict_entries}",
+                    )
+                if text == "bonjour":
+                    self.assertEqual(res.detected_lang, "fr")
 
 
 if __name__ == "__main__":

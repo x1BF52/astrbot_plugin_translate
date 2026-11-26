@@ -355,7 +355,11 @@ class TranslatePlugin(Star):
 
         meta_parts: list[str] = []
         if show_lang:
-            src_code = res.detected_lang or res.source_lang
+            src_code = (
+                res.source_lang
+                if res.source_lang != "auto"
+                else (res.detected_lang or res.source_lang)
+            )
             meta_parts.append(f"{get_lang_label(src_code)} → {get_lang_label(res.target_lang)}")
         if show_engine:
             suffix = "（备用回退）" if res.fallback_used else ""

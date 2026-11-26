@@ -39,6 +39,9 @@ DEFAULT_LLM_DICT_PROMPT = (
     "2. Common meanings grouped by part of speech (e.g. n., v., adj., adv., prep.) "
     "with multiple senses per part of speech.\n"
     "3. 1-2 short collocations or brief bilingual examples if helpful.\n"
+    "If the input is a pure ASCII word/phrase without accents and source language "
+    "is auto-detected, treat it as English unless it is clearly a foreign greeting "
+    "or loanword (e.g. bonjour, gracias, danke).\n"
     "Keep the output clean, well-structured, and free of filler."
 )
 
@@ -823,6 +826,57 @@ def redact_config_secrets(message: str, config: dict[str, Any]) -> str:
     return out
 
 
+_AMBIGUOUS_LATIN_CODES = {
+    "fr",
+    "de",
+    "es",
+    "it",
+    "pt",
+    "nl",
+    "ro",
+    "da",
+    "sv",
+    "no",
+    "id",
+    "ms",
+    "tr",
+    "pl",
+    "cs",
+    "hu",
+    "fi",
+}
+_FOREIGN_DICT_TAG_PATTERN = re.compile(
+    r"[（(<\[【]\s*(?:法|德|西|西班牙|意|意大利|葡|葡萄牙|俄|日|韩|拉丁|荷兰|阿拉伯)语?\s*[）)>\]]"
+)
+
+
+def _is_pure_ascii_words(text: str) -> bool:
+    s = (text or "").strip()
+    return bool(s) and bool(re.fullmatch(r"[A-Za-z0-9\s'\"-]+", s)) and any(ch.isalpha() for ch in s)
+
+
+def _is_confident_english_ec(ec: Any) -> bool:
+    """Return True when Youdao ec entry represents an authentic English word/phrase."""
+    if not isinstance(ec, dict):
+        return False
+    if ec.get("exam_type"):
+        return True
+    words = ec.get("word") or []
+    if not words or not isinstance(words[0], dict):
+        return False
+    trs = words[0].get("trs") or []
+    if not trs:
+        return False
+    texts: list[str] = []
+    for tr_item in trs:
+        inner = (tr_item.get("tr") or [{}])[0] if isinstance(tr_item, dict) else {}
+        vals = (inner.get("l") or {}).get("i") or []
+        texts.extend(str(x) for x in vals if isinstance(x, str))
+    if not texts or any(_FOREIGN_DICT_TAG_PATTERN.search(tx) for tx in texts):
+        return False
+    return len(texts) >= 2
+
+
 def is_word_or_phrase(text: str) -> bool:
     """Return True when text looks like a single word or short phrase suitable for dictionary lookup."""
     s = (text or "").strip()
@@ -1022,6 +1076,37 @@ class TranslationService:
                 cleaned = translated.strip()
                 if not cleaned:
                     raise TranslationError("返回译文为空")
+
+                prefetched_yd: dict[str, Any] | None = None
+                det_norm = normalize_lang(detected, allow_auto=False) or ""
+                if (
+                    preset.kind not in {"openai_compat", "astrbot_llm"}
+                    and source_lang == "auto"
+                    and dict_mode
+                    and resolved_target != "en"
+                    and _is_pure_ascii_words(text)
+                    and det_norm != "en"
+                ):
+                    prefetched_yd = await self._fetch_youdao_json(text.strip(), "en", config)
+                    if prefetched_yd and _is_confident_english_ec(prefetched_yd.get("ec")):
+                        detected = "en"
+                        if det_norm in _AMBIGUOUS_LATIN_CODES:
+                            try:
+                                re_translated, _ = await self._dispatch_provider(
+                                    preset=preset,
+                                    text=text,
+                                    source_lang="en",
+                                    target_lang=resolved_target,
+                                    config=config,
+                                    use_custom_override=(idx == 0),
+                                    llm_callback=llm_callback,
+                                    dict_mode=dict_mode,
+                                )
+                                if re_translated.strip():
+                                    cleaned = re_translated.strip()
+                            except Exception:
+                                pass
+
                 dict_entries: list[str] | None = None
                 if dict_mode and preset.kind not in {"openai_compat", "astrbot_llm"}:
                     dict_entries = await self._lookup_dictionary(
@@ -1030,6 +1115,7 @@ class TranslationService:
                         target_lang=resolved_target,
                         detected_lang=detected,
                         config=config,
+                        prefetched_youdao=prefetched_yd,
                     ) or None
                 return TranslationResult(
                     translated_text=cleaned,
@@ -2084,6 +2170,7 @@ class TranslationService:
         target_lang: str,
         detected_lang: str,
         config: dict[str, Any],
+        prefetched_youdao: dict[str, Any] | None = None,
     ) -> list[str]:
         """Fetch multi-POS dictionary senses for words/phrases without failing main translation."""
         src_hint = (
@@ -2097,7 +2184,12 @@ class TranslationService:
         prefer_youdao = target_lang == "zh-CN" and src_hint in {"en", "ja", "fr"}
         try:
             if prefer_youdao:
-                entries = await self._fetch_youdao_dict(text, src_hint, target_lang, config)
+                if prefetched_youdao is not None and src_hint == "en":
+                    entries = self._format_youdao_dict_payload(
+                        prefetched_youdao, text, src_hint, target_lang
+                    )
+                else:
+                    entries = await self._fetch_youdao_dict(text, src_hint, target_lang, config)
                 if entries:
                     return entries
                 return await self._fetch_bing_dict(text, src_hint, target_lang, config)
@@ -2106,10 +2198,43 @@ class TranslationService:
             if entries:
                 return entries
             if target_lang == "zh-CN" or (src_hint == "zh-CN" and target_lang == "en"):
+                if prefetched_youdao is not None and src_hint == "en":
+                    return self._format_youdao_dict_payload(
+                        prefetched_youdao, text, src_hint, target_lang
+                    )
                 return await self._fetch_youdao_dict(text, src_hint, target_lang, config)
         except Exception:
             return []
         return []
+
+    async def _fetch_youdao_json(
+        self,
+        text: str,
+        src_hint: str,
+        config: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        params: dict[str, str] = {"q": text}
+        if src_hint == "ja":
+            params["le"] = "jap"
+        elif src_hint == "fr":
+            params["le"] = "fr"
+
+        url = "https://dict.youdao.com/jsonapi"
+        session = await self._get_session()
+        try:
+            async with session.get(
+                url,
+                params=params,
+                headers={"User-Agent": DEFAULT_UA, "Accept": "application/json"},
+                proxy=self._request_proxy(url, config),
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                data = json.loads(await resp.text(errors="ignore"))
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
 
     async def _fetch_youdao_dict(
         self,
@@ -2120,27 +2245,19 @@ class TranslationService:
     ) -> list[str]:
         if target_lang not in {"zh-CN", "en"}:
             return []
+        data = await self._fetch_youdao_json(text, src_hint, config)
+        if not data:
+            return []
+        return self._format_youdao_dict_payload(data, text, src_hint, target_lang)
 
-        params: dict[str, str] = {"q": text}
-        if src_hint == "ja":
-            params["le"] = "jap"
-        elif src_hint == "fr":
-            params["le"] = "fr"
-
-        url = "https://dict.youdao.com/jsonapi"
-        session = await self._get_session()
-        async with session.get(
-            url,
-            params=params,
-            headers={"User-Agent": DEFAULT_UA, "Accept": "application/json"},
-            proxy=self._request_proxy(url, config),
-            timeout=aiohttp.ClientTimeout(total=5),
-        ) as resp:
-            if resp.status != 200:
-                return []
-            data = json.loads(await resp.text(errors="ignore"))
-
-        if not isinstance(data, dict):
+    def _format_youdao_dict_payload(
+        self,
+        data: dict[str, Any],
+        text: str,
+        src_hint: str,
+        target_lang: str,
+    ) -> list[str]:
+        if target_lang not in {"zh-CN", "en"} or not isinstance(data, dict):
             return []
 
         lines: list[str] = []
