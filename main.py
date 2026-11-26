@@ -13,6 +13,7 @@ from astrbot.api.star import Context, Star
 from astrbot.core.star.filter.command import GreedyStr
 
 from .translator import (
+    DEFAULT_LLM_DICT_PROMPT,
     DEFAULT_LLM_PROMPT,
     LANG_LABELS,
     PROVIDER_PRESETS,
@@ -22,7 +23,7 @@ from .translator import (
     clean_llm_translation,
     get_lang_label,
     parse_command_args,
-    redact_secret,
+    redact_config_secrets,
 )
 
 _CMD_PREFIX_PATTERN = re.compile(r"\s*\[MSG_ID:[^\]]+\]\s*$")
@@ -185,9 +186,11 @@ class TranslatePlugin(Star):
         text: str,
         source_label: str,
         target_label: str,
+        dict_mode: bool = False,
     ) -> str:
         """Translate via AstrBot's active chat LLM provider."""
-        system_prompt = DEFAULT_LLM_PROMPT.replace(
+        prompt_tpl = DEFAULT_LLM_DICT_PROMPT if dict_mode else DEFAULT_LLM_PROMPT
+        system_prompt = prompt_tpl.replace(
             "{target_lang}", target_label
         ).replace("{source_lang}", source_label)
 
@@ -239,19 +242,17 @@ class TranslatePlugin(Star):
         return clean_llm_translation(result_text)
 
     def _build_help_text(self) -> str:
-        primary_key = str(self.config.get("api_provider") or "bing_cn")
-        preset = PROVIDER_PRESETS.get(primary_key, PROVIDER_PRESETS["bing_cn"])
         default_target = str(self.config.get("default_target_lang") or "auto_zh_en")
         target_desc = (
             "智能中英互译" if default_target == "auto_zh_en" else get_lang_label(default_target)
         )
         return (
             "翻译插件使用说明：\n"
-            "• /fy <文本> 或 /翻译 <文本>\n"
+            "• /fy <文本> 或 /翻译 <文本>（单词/短语自动附带词性与多义）\n"
             "• 引用任意消息并发送 /fy 或 /翻译（支持加目标语如 /fy en）\n"
             "• 指定目标语：/fy 日语 你好  |  /fy ->ja 你好  |  /fy en->zh Hello\n"
             "• 查看支持语种：/fy --langs  |  查看配置状态：/fy --status\n"
-            f"当前引擎：{preset.name} | 默认目标：{target_desc}"
+            f"默认目标：{target_desc}"
         )
 
     def _build_langs_text(self) -> str:
@@ -301,7 +302,7 @@ class TranslatePlugin(Star):
 
     def _format_output(self, original: str, res: TranslationResult) -> str:
         adv = self.config.get("advanced") or {}
-        show_engine = adv.get("show_engine_name", True)
+        show_engine = adv.get("show_engine_name", False)
         show_lang = adv.get("show_detected_lang", True)
         show_original = adv.get("show_original", False)
 
@@ -321,6 +322,10 @@ class TranslatePlugin(Star):
             lines.append(f"译文：{res.translated_text}")
         else:
             lines.append(res.translated_text)
+        if res.dict_entries:
+            lines.append("")
+            lines.append("词典释义：")
+            lines.extend(res.dict_entries)
         return "\n".join(lines)
 
     @filter.command("fy", alias={"翻译"})
@@ -363,8 +368,15 @@ class TranslatePlugin(Star):
             )
             return
 
-        async def llm_cb(txt: str, src_lbl: str, tgt_lbl: str) -> str:
-            return await self._call_astrbot_llm(event, txt, src_lbl, tgt_lbl)
+        async def llm_cb(
+            txt: str,
+            src_lbl: str,
+            tgt_lbl: str,
+            dict_mode: bool = False,
+        ) -> str:
+            return await self._call_astrbot_llm(
+                event, txt, src_lbl, tgt_lbl, dict_mode=dict_mode
+            )
 
         try:
             result = await self._service.translate(
@@ -375,12 +387,12 @@ class TranslatePlugin(Star):
                 llm_callback=llm_cb,
             )
         except TranslationError as exc:
-            safe_msg = redact_secret(str(exc), str(self.config.get("api_key") or "").strip())
+            safe_msg = redact_config_secrets(str(exc), self.config)
             logger.warning("翻译失败: %s", safe_msg)
             yield event.plain_result(f"翻译失败：{safe_msg}")
             return
         except Exception as exc:
-            safe_msg = redact_secret(str(exc), str(self.config.get("api_key") or "").strip())
+            safe_msg = redact_config_secrets(str(exc), self.config)
             logger.error("翻译插件异常: %s", safe_msg, exc_info=True)
             yield event.plain_result(f"翻译时发生内部错误：{safe_msg}")
             return

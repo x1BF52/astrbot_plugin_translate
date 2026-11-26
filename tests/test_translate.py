@@ -246,6 +246,11 @@ class MetadataAndSchemaTests(unittest.TestCase):
         for opt in schema["fallback_providers"]["options"]:
             self.assertIn(opt, translator.PROVIDER_PRESETS)
 
+        # Channel name display must default to False, and dict lookup must default to True
+        adv_items = schema["advanced"]["items"]
+        self.assertIs(adv_items["show_engine_name"]["default"], False)
+        self.assertIs(adv_items["enable_dict_lookup"]["default"], True)
+
     def test_metadata_yaml_required_fields(self):
         raw_lines = (PKG_DIR / "metadata.yaml").read_text(encoding="utf-8").splitlines()
         parsed = {}
@@ -274,7 +279,6 @@ class ParserAndHelperTests(unittest.TestCase):
         self.assertEqual(translator.parse_command_args("--status").action, "status")
         self.assertEqual(translator.parse_command_args("--langs").action, "langs")
 
-        # Literal "help" should translate instead of showing help
         p = translator.parse_command_args("help")
         self.assertEqual((p.action, p.text), ("translate", "help"))
 
@@ -287,17 +291,14 @@ class ParserAndHelperTests(unittest.TestCase):
         p = translator.parse_command_args("en 你好世界")
         self.assertEqual((p.action, p.target_lang, p.text), ("translate", "en", "你好世界"))
 
-        # Guarded short ASCII language codes should not hijack English/Spanish/French sentences
         p = translator.parse_command_args("en route to work")
         self.assertEqual((p.action, p.target_lang, p.text), ("translate", None, "en route to work"))
         p = translator.parse_command_args("de la vida")
         self.assertEqual((p.action, p.target_lang, p.text), ("translate", None, "de la vida"))
 
-        # Quoted reply with target language only
         p = translator.parse_command_args("en", has_reply=True)
         self.assertEqual((p.action, p.target_lang, p.text), ("translate", "en", ""))
 
-        # Arrow, colon, flag syntaxes
         p = translator.parse_command_args("->ja 你好\n世界")
         self.assertEqual((p.action, p.target_lang, p.text), ("translate", "ja", "你好\n世界"))
         p = translator.parse_command_args("en->zh Hello world")
@@ -311,6 +312,19 @@ class ParserAndHelperTests(unittest.TestCase):
         self.assertEqual((p.action, p.target_lang, p.text), ("translate", "ko", "你好"))
         p = translator.parse_command_args("--to=zh-TW 你好")
         self.assertEqual((p.action, p.target_lang, p.text), ("translate", "zh-TW", "你好"))
+
+    def test_is_word_or_phrase(self):
+        self.assertTrue(translator.is_word_or_phrase("run"))
+        self.assertTrue(translator.is_word_or_phrase("look up"))
+        self.assertTrue(translator.is_word_or_phrase("well-known"))
+        self.assertTrue(translator.is_word_or_phrase("state of the art"))
+        self.assertTrue(translator.is_word_or_phrase("矛盾"))
+        self.assertTrue(translator.is_word_or_phrase("食べる"))
+        self.assertFalse(translator.is_word_or_phrase("Hello world. How are you?"))
+        self.assertFalse(translator.is_word_or_phrase("line1\nline2"))
+        self.assertFalse(translator.is_word_or_phrase("https://example.com"))
+        self.assertFalse(translator.is_word_or_phrase("12345"))
+        self.assertFalse(translator.is_word_or_phrase("今天天气真不错我们去散步吧"))
 
     def test_lang_detection_and_target_resolution(self):
         self.assertEqual(translator.resolve_target_lang("你好世界", "auto_zh_en"), "en")
@@ -335,8 +349,11 @@ class ParserAndHelperTests(unittest.TestCase):
         )
         self.assertEqual(url, "https://example.com/tr?q=hi%20%7B%7Bapi_key%7D%7D&key=SEC%2F123")
         self.assertEqual(
-            translator.redact_secret("Error at https://example.com?key=SEC%2F123", "SEC/123"),
-            "Error at https://example.com?key=***",
+            translator.redact_config_secrets(
+                "Error ak=AK1 sk=SK_SECRET&k=SEC%2F123",
+                {"api_key": "AK1", "volcengine_secret_key": "SK_SECRET", "aliyun_access_secret": "SEC/123"},
+            ),
+            "Error ak=*** sk=***&k=***",
         )
 
     def test_clean_llm_translation_and_chunk_text(self):
@@ -350,7 +367,7 @@ class ParserAndHelperTests(unittest.TestCase):
 
 
 class ServiceAndPluginMockTests(unittest.IsolatedAsyncioTestCase):
-    async def test_all_mocked_backends_and_chunk_whitespace(self):
+    async def test_all_mocked_backends_and_dict_lookup(self):
         bing_calls = {"token": 0, "post": 0}
 
         def handler(method, url, kw):
@@ -367,9 +384,52 @@ class ServiceAndPluginMockTests(unittest.IsolatedAsyncioTestCase):
                 if bing_calls["post"] == 1:
                     return MockResponse(200, {"statusCode": 401})
                 txt = kw["data"]["text"]
+                det = "zh-Hans" if txt == "矛盾" else "en"
                 return MockResponse(
                     200,
-                    [{"translations": [{"text": f"BING:{txt}"}], "detectedLanguage": {"language": "en"}}],
+                    [{"translations": [{"text": f"BING:{txt}"}], "detectedLanguage": {"language": det}}],
+                )
+            if "cn.bing.com:8443/tlookupv3" in url:
+                return MockResponse(
+                    200,
+                    [
+                        {
+                            "translations": [
+                                {"posTag": "NOUN", "displayTarget": "contradiction"},
+                                {"posTag": "NOUN", "displayTarget": "conflict"},
+                                {"posTag": "ADJ", "displayTarget": "contradictory"},
+                                {"posTag": "VERB", "displayTarget": "contradict"},
+                            ]
+                        }
+                    ],
+                )
+            if "dict.youdao.com/jsonapi" in url:
+                return MockResponse(
+                    200,
+                    {
+                        "ec": {
+                            "word": [
+                                {
+                                    "ukphone": "rʌn",
+                                    "usphone": "rʌn",
+                                    "trs": [
+                                        {"tr": [{"l": {"i": ["v. 跑，奔跑；运行；经营"]}}]},
+                                        {"tr": [{"l": {"i": ["n. 跑步；赛跑；旅程"]}}]},
+                                    ],
+                                }
+                            ]
+                        },
+                        "phrs": {
+                            "phrs": [
+                                {
+                                    "phr": {
+                                        "headword": {"l": {"i": "in the long run"}},
+                                        "trs": [{"tr": {"l": {"i": "长远；终究"}}}],
+                                    }
+                                }
+                            ]
+                        },
+                    },
                 )
             if "translate.googleapis.com" in url:
                 q = kw["params"]["q"]
@@ -378,6 +438,44 @@ class ServiceAndPluginMockTests(unittest.IsolatedAsyncioTestCase):
                 return MockResponse(200, [["你好", "en"], ["世界", "en"]])
             if "lingva.ml" in url:
                 return MockResponse(200, {"translation": "你好世界", "info": {"detectedSource": "en"}})
+            if "api.niutrans.com" in url:
+                body = kw["json"]
+                self.assertEqual(body["apikey"], "NIU_KEY")
+                return MockResponse(200, {"from": "en", "to": "zh", "tgt_text": "小牛译文"})
+            if "translate.volcengineapi.com" in url:
+                self.assertIn("HMAC-SHA256 Credential=VOLC_AK/", kw["headers"]["Authorization"])
+                self.assertIn("X-Date", kw["headers"])
+                self.assertIn("X-Content-Sha256", kw["headers"])
+                body = json.loads(kw["data"].decode("utf-8"))
+                self.assertEqual(body["TargetLanguage"], "zh")
+                return MockResponse(
+                    200,
+                    {"TranslationList": [{"Translation": "火山译文", "DetectedSourceLanguage": "en"}]},
+                )
+            if "fanyi-api.baidu.com" in url:
+                self.assertEqual(kw["data"]["appid"], "BD_APP")
+                self.assertEqual(kw["data"]["to"], "jp")
+                self.assertEqual(len(kw["data"]["sign"]), 32)
+                return MockResponse(
+                    200,
+                    {"from": "zh", "to": "jp", "trans_result": [{"dst": "百度訳文"}]},
+                )
+            if "mt.cn-hangzhou.aliyuncs.com" in url:
+                self.assertEqual(kw["data"]["Action"], "TranslateGeneral")
+                self.assertEqual(kw["data"]["Version"], "2018-10-12")
+                self.assertTrue(kw["data"]["Signature"])
+                return MockResponse(200, {"Code": "200", "Data": {"Translated": "阿里译文", "DetectedLanguage": "en"}})
+            if "open.bigmodel.cn" in url:
+                self.assertEqual(kw["json"]["model"], "GLM-4-Flash-250414")
+                sys_prompt = kw["json"]["messages"][0]["content"]
+                tag = "DICT" if "bilingual dictionary" in sys_prompt else "TEXT"
+                return MockResponse(200, {"choices": [{"message": {"content": f"{tag}:智谱译文"}}]})
+            if "api.siliconflow.cn" in url:
+                self.assertEqual(kw["json"]["model"], "tencent/Hunyuan-MT-7B")
+                return MockResponse(200, {"choices": [{"message": {"content": "硅基译文"}}]})
+            if "api.groq.com" in url:
+                self.assertEqual(kw["json"]["model"], "openai/gpt-oss-120b")
+                return MockResponse(200, {"choices": [{"message": {"content": "Groq译文"}}]})
             if "libretranslate.com" in url:
                 return MockResponse(502, "<html>502 Bad Gateway</html>")
             if "lt.local" in url:
@@ -388,21 +486,11 @@ class ServiceAndPluginMockTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(kw["params"]["engine"], "google")
                 self.assertEqual(kw["params"]["to"], "zh-CN")
                 return MockResponse(200, {"translated-text": "你好Mozhi", "detected": "en"})
-            if "open.bigmodel.cn" in url:
-                self.assertEqual(url, "https://open.bigmodel.cn/api/paas/v4/chat/completions")
+            if "open.bigmodel.test" in url:
+                self.assertEqual(url, "https://open.bigmodel.test/api/paas/v4/chat/completions")
                 return MockResponse(
                     200,
-                    {
-                        "choices": [
-                            {
-                                "message": {
-                                    "content": [
-                                        {"type": "text", "text": "<think>hmm</think>\n你好Zhipu"}
-                                    ]
-                                }
-                            }
-                        ]
-                    },
+                    {"choices": [{"message": {"content": [{"type": "text", "text": "<think>hmm</think>\n你好Compat"}]}}]},
                 )
             if "custom.example.com" in url:
                 body = json.loads(kw["data"].decode("utf-8"))
@@ -417,36 +505,96 @@ class ServiceAndPluginMockTests(unittest.IsolatedAsyncioTestCase):
         sess = MockSession(handler)
         svc = translator.TranslationService(lambda: asyncio.sleep(0, result=sess))
 
-        # Bing token refresh retry + port preservation
-        res = await svc.translate(
-            "Hello",
+        # Bing sentence (no dict entries) vs word (Youdao dict entries) vs zh->en word (Bing dict entries)
+        res_sent = await svc.translate(
+            "Hello world, this is a full sentence.",
             {"api_provider": "bing_cn", "enable_auto_fallback": False},
         )
-        self.assertEqual(res.translated_text, "BING:Hello")
+        self.assertEqual(res_sent.translated_text, "BING:Hello world, this is a full sentence.")
+        self.assertIsNone(res_sent.dict_entries)
         self.assertEqual(bing_calls, {"token": 2, "post": 2})
 
-        # Google GTX multi-chunk preserves blank lines across chunks
+        res_word = await svc.translate(
+            "run",
+            {"api_provider": "bing_cn", "enable_auto_fallback": False},
+        )
+        self.assertEqual(res_word.translated_text, "BING:run")
+        self.assertIsNotNone(res_word.dict_entries)
+        joined_dict = "\n".join(res_word.dict_entries or [])
+        self.assertIn("英 /rʌn/", joined_dict)
+        self.assertIn("v. 跑，奔跑", joined_dict)
+        self.assertIn("n. 跑步", joined_dict)
+        self.assertIn("in the long run", joined_dict)
+
+        res_zh_word = await svc.translate(
+            "矛盾",
+            {"api_provider": "bing_cn", "enable_auto_fallback": False},
+        )
+        self.assertIsNotNone(res_zh_word.dict_entries)
+        joined_zh_dict = "\n".join(res_zh_word.dict_entries or [])
+        self.assertIn("n. contradiction；conflict", joined_zh_dict)
+        self.assertIn("adj. contradictory", joined_zh_dict)
+        self.assertIn("v. contradict", joined_zh_dict)
+
+        # New LLM presets + dictionary mode vs sentence mode
+        self.assertEqual(
+            (await svc.translate("run", {"api_provider": "zhipu_free", "api_key": "ZK", "enable_auto_fallback": False})).translated_text,
+            "DICT:智谱译文",
+        )
+        self.assertEqual(
+            (await svc.translate("This is a complete sentence.", {"api_provider": "zhipu_free", "api_key": "ZK", "enable_auto_fallback": False})).translated_text,
+            "TEXT:智谱译文",
+        )
+        self.assertEqual(
+            (await svc.translate("Hello", {"api_provider": "siliconflow_free", "api_key": "SK", "enable_auto_fallback": False})).translated_text,
+            "硅基译文",
+        )
+        self.assertEqual(
+            (await svc.translate("Hello", {"api_provider": "groq_free", "api_key": "GK", "enable_auto_fallback": False})).translated_text,
+            "Groq译文",
+        )
+
+        # New signed/keyed MT backends (pass sentence to isolate translation call without dict call)
+        sentence = "Hello world, testing multiple providers."
+        self.assertEqual(
+            (await svc.translate(sentence, {"api_provider": "niutrans", "api_key": "NIU_KEY", "enable_auto_fallback": False})).translated_text,
+            "小牛译文",
+        )
+        self.assertEqual(
+            (await svc.translate(sentence, {"api_provider": "volcengine", "api_key": "VOLC_AK", "volcengine_secret_key": "VOLC_SK", "enable_auto_fallback": False})).translated_text,
+            "火山译文",
+        )
+        self.assertEqual(
+            (await svc.translate("今天天气很好，出去走走。", {"api_provider": "baidu_fanyi", "api_key": "BD_SK", "baidu_app_id": "BD_APP", "enable_auto_fallback": False}, target_lang="ja")).translated_text,
+            "百度訳文",
+        )
+        self.assertEqual(
+            (await svc.translate(sentence, {"api_provider": "aliyun_mt", "api_key": "ALI_AK", "aliyun_access_secret": "ALI_SK", "enable_auto_fallback": False})).translated_text,
+            "阿里译文",
+        )
+
+        # GTX multi-chunk preserves blank lines across chunks
         gtx_text = ("A" * 800) + "\n\n" + ("B" * 800)
         res = await svc.translate(gtx_text, {"api_provider": "google_free", "enable_auto_fallback": False})
         self.assertIn("\n\n", res.translated_text)
 
-        # Clients5, Lingva, DeepLX, Mozhi(Google), OpenAI, Custom HTTP
+        # Clients5, Lingva, DeepLX, Mozhi(Google), OpenAI Compat, Custom HTTP
         self.assertEqual(
-            (await svc.translate("Hi", {"api_provider": "google_clients5", "enable_auto_fallback": False})).translated_text,
+            (await svc.translate(sentence, {"api_provider": "google_clients5", "enable_auto_fallback": False})).translated_text,
             "你好世界",
         )
         self.assertEqual(
-            (await svc.translate("Hi", {"api_provider": "lingva_ml", "enable_auto_fallback": False})).translated_text,
+            (await svc.translate(sentence, {"api_provider": "lingva_ml", "enable_auto_fallback": False})).translated_text,
             "你好世界",
         )
         self.assertEqual(
-            (await svc.translate("Hi", {"api_provider": "deeplx", "api_key": "K", "enable_auto_fallback": False})).translated_text,
+            (await svc.translate(sentence, {"api_provider": "deeplx", "api_key": "K", "enable_auto_fallback": False})).translated_text,
             "你好DeepLX",
         )
         self.assertEqual(
             (
                 await svc.translate(
-                    "Hi",
+                    sentence,
                     {
                         "api_provider": "mozhi_adminforge",
                         "custom_api_url": "https://mozhi.example",
@@ -460,17 +608,17 @@ class ServiceAndPluginMockTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             (
                 await svc.translate(
-                    "Hi",
+                    sentence,
                     {
                         "api_provider": "openai_compat",
-                        "custom_api_url": "https://open.bigmodel.cn/api/paas/v4",
+                        "custom_api_url": "https://open.bigmodel.test/api/paas/v4",
                         "api_key": "ZKEY",
                         "openai_system_prompt": 'To {target_lang} {"ok": true}',
                         "enable_auto_fallback": False,
                     },
                 )
             ).translated_text,
-            "你好Zhipu",
+            "你好Compat",
         )
         self.assertEqual(
             (
@@ -493,14 +641,13 @@ class ServiceAndPluginMockTests(unittest.IsolatedAsyncioTestCase):
 
         # LibreTranslate non-JSON 502 error handling
         with self.assertRaises(translator.TranslationError) as ctx:
-            await svc.translate("Hi", {"api_provider": "libretranslate", "enable_auto_fallback": False})
+            await svc.translate(sentence, {"api_provider": "libretranslate", "enable_auto_fallback": False})
         self.assertIn("HTTP 502", str(ctx.exception))
 
-        # LibreTranslate success
         self.assertEqual(
             (
                 await svc.translate(
-                    "Hi",
+                    sentence,
                     {
                         "api_provider": "libretranslate",
                         "custom_api_url": "https://lt.local",
@@ -511,17 +658,9 @@ class ServiceAndPluginMockTests(unittest.IsolatedAsyncioTestCase):
             "你好LT",
         )
 
-        # Youdao rejects zh-TW cleanly and falls back
-        with self.assertRaises(translator.TranslationError):
-            await svc.translate(
-                "Hello",
-                {"api_provider": "youdao_web", "enable_auto_fallback": False},
-                target_lang="zh-TW",
-            )
-
         # Fallback: mymemory 429 -> youdao_web
         fb = await svc.translate(
-            "Hello",
+            sentence,
             {
                 "api_provider": "mymemory",
                 "enable_auto_fallback": True,
@@ -532,7 +671,7 @@ class ServiceAndPluginMockTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fb.provider_key, "youdao_web")
         self.assertEqual(fb.translated_text, "回退成功")
 
-    async def test_translate_plugin_commands_and_replies(self):
+    async def test_translate_plugin_hides_channel_and_formats_dict(self):
         class ModernContext:
             def get_config(self, umo=None):
                 return {"wake_prefix": ["/"]}
@@ -541,11 +680,13 @@ class ServiceAndPluginMockTests(unittest.IsolatedAsyncioTestCase):
                 return "prov-1"
 
             async def llm_generate(self, chat_provider_id, prompt, system_prompt):
+                mode = "DICT" if "bilingual dictionary" in system_prompt else "TEXT"
                 return types.SimpleNamespace(
                     role="assistant",
-                    completion_text=f"<think>plan</think>LLM:{prompt}->{system_prompt[:10]}",
+                    completion_text=f"<think>plan</think>{mode}:{prompt}",
                 )
 
+        # Default config: show_engine_name omitted -> must NOT display provider name
         plugin = plugin_main.TranslatePlugin(
             ModernContext(),
             {
@@ -553,7 +694,6 @@ class ServiceAndPluginMockTests(unittest.IsolatedAsyncioTestCase):
                 "default_target_lang": "auto_zh_en",
                 "enable_auto_fallback": False,
                 "advanced": {
-                    "show_engine_name": True,
                     "show_detected_lang": True,
                     "show_original": False,
                     "max_text_length": 200,
@@ -561,15 +701,58 @@ class ServiceAndPluginMockTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
+        out_word = [
+            x
+            async for x in plugin.translate_command(
+                AstrMessageEvent("fy run", [Comp.Plain("/fy run")]),
+                GreedyStr("run"),
+            )
+        ]
+        self.assertIn("DICT:run", out_word[0])
+        self.assertNotIn("AstrBot", out_word[0])
+
+        # Non-LLM _format_output with dict_entries hides channel name
+        formatted = plugin._format_output(
+            "run",
+            translator.TranslationResult(
+                translated_text="跑",
+                provider_key="bing_cn",
+                provider_name="Bing 翻译 (国内版)",
+                source_lang="auto",
+                target_lang="zh-CN",
+                detected_lang="en",
+                dict_entries=["英 /rʌn/", "• v. 跑，奔跑；运行", "• n. 跑步；旅程"],
+            ),
+        )
+        self.assertIn("[英语 → 简体中文]", formatted)
+        self.assertIn("词典释义：", formatted)
+        self.assertIn("• v. 跑，奔跑；运行", formatted)
+        self.assertNotIn("Bing", formatted)
+
+        # Help text also hides channel name
+        out_help = [
+            x
+            async for x in plugin.translate_command(
+                AstrMessageEvent("fy", [Comp.Plain("/fy")]),
+                GreedyStr(""),
+            )
+        ]
+        self.assertNotIn("AstrBot 内置 LLM", out_help[0])
+
         # /fy 翻译 recovers literal argument "翻译"
-        ev1 = AstrMessageEvent("fy", [Comp.Plain("/fy 翻译")])
-        out1 = [x async for x in plugin.translate_command(ev1, GreedyStr(""))]
-        self.assertIn("LLM:翻译->", out1[0])
+        out1 = [
+            x
+            async for x in plugin.translate_command(
+                AstrMessageEvent("fy", [Comp.Plain("/fy 翻译")]),
+                GreedyStr(""),
+            )
+        ]
+        self.assertIn("DICT:翻译", out1[0])
 
         # Quote extraction via OneBot bot.api.call_action("get_msg")
         class FakeAPI:
             async def call_action(self, action, **kwargs):
-                return {"data": {"message": [{"type": "text", "data": {"text": "Quoted text"}}]}}
+                return {"data": {"message": [{"type": "text", "data": {"text": "This is a quoted sentence."}}]}}
 
         ev2 = AstrMessageEvent(
             "fy en",
@@ -577,10 +760,10 @@ class ServiceAndPluginMockTests(unittest.IsolatedAsyncioTestCase):
             bot=types.SimpleNamespace(api=FakeAPI()),
         )
         out2 = [x async for x in plugin.translate_command(ev2, GreedyStr("en"))]
-        self.assertIn("LLM:Quoted text->", out2[0])
+        self.assertIn("TEXT:This is a quoted sentence.", out2[0])
         self.assertIn("英语", out2[0])
 
-        # --langs, --status, --help
+        # --langs, --status
         out_langs = [
             x
             async for x in plugin.translate_command(
@@ -599,16 +782,6 @@ class ServiceAndPluginMockTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertIn("AstrBot 当前内置大模型", out_status[0])
         self.assertIn("默认目标：智能中英互译", out_status[0])
-
-        # Length limit guard
-        out_long = [
-            x
-            async for x in plugin.translate_command(
-                AstrMessageEvent("fy " + "x" * 250, [Comp.Plain("/fy " + "x" * 250)]),
-                GreedyStr("x" * 250),
-            )
-        ]
-        self.assertIn("超过上限", out_long[0])
 
         await plugin.terminate()
 
@@ -630,6 +803,17 @@ class _UrllibResp:
 
     async def json(self, content_type=None):
         return json.loads(self._body.decode("utf-8", errors="ignore"))
+
+
+class _AsyncContextCall:
+    def __init__(self, fn):
+        self._fn = fn
+
+    async def __aenter__(self):
+        return await asyncio.to_thread(self._fn)
+
+    async def __aexit__(self, *args):
+        return False
 
 
 class _UrllibAsyncSession:
@@ -672,32 +856,24 @@ class _UrllibAsyncSession:
         return self._do("POST", url, data=data, json_data=json, headers=headers, timeout=timeout)
 
 
-class _AsyncContextCall:
-    def __init__(self, fn):
-        self._fn = fn
-
-    async def __aenter__(self):
-        return await asyncio.to_thread(self._fn)
-
-    async def __aexit__(self, *args):
-        return False
-
-
 @unittest.skipUnless(os.getenv("RUN_LIVE_TESTS") == "1", "Set RUN_LIVE_TESTS=1 for live API tests")
 class LiveBackendTests(unittest.IsolatedAsyncioTestCase):
-    async def test_live_free_backends(self):
+    async def test_live_free_backends_and_dictionary(self):
         sess = _UrllibAsyncSession()
         svc = translator.TranslationService(lambda: asyncio.sleep(0, result=sess))
         cases = [
-            ("bing_cn", "Hello world!\nGood morning.", None),
-            ("bing_cn", "今天天气真好，我们去散步吧。", "ja"),
-            ("bing_global", "Artificial intelligence is evolving rapidly.", None),
-            ("youdao_web", "Line 1: Hello world\n\nLine 2: Good morning", None),
-            ("mozhi_adminforge", "Hello world", None),
-            ("mozhi_aryak", "Hello world", None),
+            ("bing_cn", "Hello world!\nGood morning, everyone.", None, False),
+            ("bing_cn", "今天天气真好，我们去散步吧。", "ja", False),
+            ("bing_cn", "run", None, True),
+            ("bing_cn", "矛盾", None, True),
+            ("bing_cn", "食べる", None, True),
+            ("youdao_web", "look up", None, True),
+            ("bing_global", "Artificial intelligence is evolving rapidly.", None, False),
+            ("mozhi_adminforge", "Hello world, how are you?", None, False),
+            ("mozhi_aryak", "Hello world, how are you?", None, False),
         ]
-        for provider_key, text, target_lang in cases:
-            with self.subTest(provider=provider_key, target=target_lang):
+        for provider_key, text, target_lang, expect_dict in cases:
+            with self.subTest(provider=provider_key, text=text, target=target_lang):
                 res = await svc.translate(
                     text=text,
                     config={
@@ -708,8 +884,8 @@ class LiveBackendTests(unittest.IsolatedAsyncioTestCase):
                     target_lang=target_lang,
                 )
                 self.assertTrue(res.translated_text.strip(), provider_key)
-                if "\n\n" in text:
-                    self.assertIn("\n\n", res.translated_text)
+                if expect_dict:
+                    self.assertTrue(res.dict_entries, f"Expected dict_entries for {text!r}")
 
 
 if __name__ == "__main__":

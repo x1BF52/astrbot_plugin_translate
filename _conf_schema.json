@@ -4,7 +4,7 @@
     "type": "string",
     "default": "bing_cn",
     "obvious_hint": true,
-    "hint": "内置多个常见免费免密钥翻译 API（默认 Bing 国内直连），也可选择开源自建接口、OpenAI 兼容接口或 AstrBot 内置大模型。",
+    "hint": "内置免密钥直连免费 API（默认 Bing 国内直连），也包含小牛/火山/百度/阿里/智谱/硅基流动/Groq 等免费开放平台预设，以及自建与自定义接口。",
     "options": [
       "bing_cn",
       "bing_global",
@@ -16,6 +16,13 @@
       "mozhi_aryak",
       "mozhi_pussthecat",
       "lingva_ml",
+      "zhipu_free",
+      "siliconflow_free",
+      "groq_free",
+      "niutrans",
+      "volcengine",
+      "baidu_fanyi",
+      "aliyun_mt",
       "libretranslate",
       "deeplx",
       "openai_compat",
@@ -33,16 +40,23 @@
       "Mozhi 公共实例（Aryak） - https://mozhi.aryak.me/api/translate",
       "Mozhi 公共实例（PussTheCat） - https://mozhi.pussthecat.org/api/translate",
       "Lingva 接口 - https://lingva.ml/api/v1",
+      "智谱 AI（GLM-4-Flash 长期免费） - https://open.bigmodel.cn/api/paas/v4/chat/completions",
+      "硅基流动（免费翻译/开源模型） - https://api.siliconflow.cn/v1/chat/completions",
+      "Groq（免费速率限制开源模型） - https://api.groq.com/openai/v1/chat/completions",
+      "小牛翻译（每日 20 万字符免费） - https://api.niutrans.com/NiuTransServer/translation",
+      "火山引擎机器翻译（每月 200 万免费） - https://translate.volcengineapi.com",
+      "百度翻译开放平台（每月 5万/100万免费） - https://fanyi-api.baidu.com/api/trans/vip/translate",
+      "阿里云机器翻译（每月 100 万免费） - https://mt.cn-hangzhou.aliyuncs.com",
       "LibreTranslate 接口 - https://libretranslate.com/translate",
       "DeepLX 接口 - http://127.0.0.1:1188/translate",
-      "OpenAI 兼容接口（自定义 URL / 免费 LLM API）",
+      "OpenAI 兼容接口（自定义 URL / Ollama 等）",
       "AstrBot 当前内置大模型（无需额外配置）",
       "自定义 HTTP 翻译 API（通用模板）"
     ],
     "subtitles": [
       "免费免密钥，国内可直接访问，支持自动检测语种与多行排版",
       "免费免密钥，适合海外服务器或配置代理后使用",
-      "免费免密钥，国内直连稳定，支持中/英/日/韩/法/俄/西互译",
+      "免费免密钥，国内直连稳定，支持简体中文与外语互译",
       "免费公开 REST 接口，无需密钥（高频请求可能触发限流）",
       "免费免密钥，海外直连或配合下方代理/自定义镜像地址使用",
       "Google 备用免费接口，海外直连或配合代理/自定义镜像使用",
@@ -50,9 +64,16 @@
       "开源多引擎隐私前端，免费免密钥（默认 yandex 引擎）",
       "开源多引擎隐私前端，免费免密钥（默认 duckduckgo 引擎）",
       "Google 翻译开源前端；公共实例易限流，建议在下方填写自建实例地址",
-      "开源机器翻译 API；官方站需填 API Key，自建或免密镜像可留空",
+      "国内直连，需填智谱 API Key；GLM-4-Flash-250414 / GLM-4.7-Flash 免费",
+      "国内直连，需填硅基流动 API Key；默认 tencent/Hunyuan-MT-7B 免费端点",
+      "海外/代理可用，需填 Groq API Key；默认 openai/gpt-oss-120b 免费层",
+      "需填小牛 API Key；每日免费 20 万字符，超额不自动扣费",
+      "需填 AccessKey ID 与 Secret；每月前 200 万免费（请在控制台设余额预警）",
+      "需填 APP ID 与密钥；未认证 5 万/月，个人认证 100 万/月（建议开额度提醒）",
+      "需填 AccessKey ID 与 Secret；通用版每月前 100 万字符免费",
+      "开源机器翻译 API；官方站需填 Key，自建或本地 Docker 免密免费",
       "DeepLX 兼容接口，需配合本地或自建 DeepLX 服务使用",
-      "兼容 SiliconFlow / DeepSeek / Groq / Ollama / GitHub Models 等接口",
+      "兼容任意 OpenAI 格式接口、中转站或本地 Ollama",
       "直接复用 AstrBot 主配置当前生效的对话 LLM 提供商",
       "自由配置任意 GET/POST 翻译接口 URL、请求体模板与响应 JSON 路径"
     ]
@@ -61,14 +82,70 @@
     "description": "自定义 API 地址（可选，留空使用所选预设默认地址）",
     "type": "string",
     "default": "",
-    "hint": "填入完整 URL 可覆盖上方预设地址，例如自建镜像 https://your-lingva.example/api/v1、http://127.0.0.1:5000/translate、http://127.0.0.1:1188/translate 或 https://api.deepseek.com/v1/chat/completions。"
+    "hint": "填入完整 URL 可覆盖上方预设地址，例如自建 Lingva / LibreTranslate / DeepLX、本地 Ollama http://127.0.0.1:11434/v1/chat/completions 或自定义 API 地址。"
   },
   "api_key": {
-    "description": "API Key / 访问令牌（可选）",
+    "description": "API Key / AccessKey ID / 密钥（免密接口留空）",
     "type": "string",
     "default": "",
     "secret": true,
-    "hint": "仅在使用需要鉴权的接口时填写（如官方 LibreTranslate、DeepLX Token、OpenAI 兼容接口或自定义模板 {{api_key}}）；Bing / 有道 / MyMemory / Google 免费接口留空即可。"
+    "hint": "Bing / 有道网页 / MyMemory / Google / Mozhi 留空即可；智谱/硅基流动/Groq/小牛/DeepLX/OpenAI 填 API Key；百度填密钥；火山引擎与阿里云填 AccessKey ID。"
+  },
+  "volcengine_secret_key": {
+    "description": "火山引擎 Secret AccessKey",
+    "type": "string",
+    "default": "",
+    "secret": true,
+    "condition": {
+      "api_provider": "volcengine"
+    },
+    "hint": "请在上方 API Key 填入 AccessKey ID，此处填入对应的 Secret AccessKey（每月前 200 万字符免费，建议在火山控制台开启余额预警）。"
+  },
+  "baidu_app_id": {
+    "description": "百度翻译 APP ID",
+    "type": "string",
+    "default": "",
+    "condition": {
+      "api_provider": "baidu_fanyi"
+    },
+    "hint": "请在上方 API Key 填入百度翻译密钥，此处填入 APP ID。"
+  },
+  "aliyun_access_secret": {
+    "description": "阿里云 AccessKey Secret",
+    "type": "string",
+    "default": "",
+    "secret": true,
+    "condition": {
+      "api_provider": "aliyun_mt"
+    },
+    "hint": "请在上方 API Key 填入 AccessKey ID，此处填入对应的 AccessKey Secret。"
+  },
+  "zhipu_model": {
+    "description": "智谱 AI 模型名称",
+    "type": "string",
+    "default": "GLM-4-Flash-250414",
+    "condition": {
+      "api_provider": "zhipu_free"
+    },
+    "hint": "免费模型可选 GLM-4-Flash-250414、GLM-4.7-Flash（注意 GLM-4.5-Flash 已下线）。"
+  },
+  "siliconflow_model": {
+    "description": "硅基流动模型名称",
+    "type": "string",
+    "default": "tencent/Hunyuan-MT-7B",
+    "condition": {
+      "api_provider": "siliconflow_free"
+    },
+    "hint": "免费模型示例：tencent/Hunyuan-MT-7B、THUDM/GLM-4-9B-0414、Qwen/Qwen3-8B（勿带 Pro/ 前缀）。"
+  },
+  "groq_model": {
+    "description": "Groq 模型名称",
+    "type": "string",
+    "default": "openai/gpt-oss-120b",
+    "condition": {
+      "api_provider": "groq_free"
+    },
+    "hint": "免费层模型示例：openai/gpt-oss-120b、openai/gpt-oss-20b、qwen/qwen3.8-27b。"
   },
   "default_target_lang": {
     "description": "默认目标语言",
@@ -110,7 +187,7 @@
       "始终默认翻译为西班牙语",
       "始终默认翻译为俄语"
     ],
-    "hint": "指令中也可临时指定目标语言，例如：/fy ->ja 你好 或 /fy en->zh Hello。"
+    "hint": "指令中也可临时指定目标语言，例如：/fy 日语 你好、/fy ->ja 你好 或 /fy en->zh Hello。"
   },
   "enable_auto_fallback": {
     "description": "主 API 失败时自动切换备用免费 API",
@@ -162,7 +239,7 @@
     "description": "HTTP 代理地址（可选）",
     "type": "string",
     "default": "",
-    "hint": "如需在受限网络下访问 Google / Lingva / 海外大模型接口，可填写 http://127.0.0.1:7890；留空则直连并遵循系统环境变量代理。"
+    "hint": "如需在受限网络下访问 Google / Lingva / Groq 等海外接口，可填写 http://127.0.0.1:7890；留空则直连并遵循系统环境变量代理。"
   },
   "openai_model": {
     "description": "OpenAI 兼容模型名称",
@@ -171,7 +248,7 @@
     "condition": {
       "api_provider": "openai_compat"
     },
-    "hint": "填写对应服务商支持的模型 ID，例如 deepseek-chat、Qwen/Qwen2.5-7B-Instruct、llama-3.3-70b-versatile、gpt-4o-mini 等。"
+    "hint": "填写对应服务商支持的模型 ID，例如 deepseek-chat、Qwen/Qwen3-8B、gpt-4o-mini 等。"
   },
   "openai_system_prompt": {
     "description": "大模型翻译系统提示词",
@@ -180,7 +257,7 @@
     "condition": {
       "api_provider": "openai_compat"
     },
-    "hint": "支持 {target_lang} 与 {source_lang} 占位符。"
+    "hint": "支持 {target_lang} 与 {source_lang} 占位符；保持默认提示词时，单词/短语会自动切换为多词性词典模式。"
   },
   "custom_http_method": {
     "description": "自定义 HTTP 请求方法",
@@ -226,6 +303,28 @@
     "type": "object",
     "collapsed": true,
     "items": {
+      "enable_dict_lookup": {
+        "description": "单词/短语自动展示多词性与多释义",
+        "type": "bool",
+        "default": true,
+        "hint": "输入单词或短语时，自动附带音标、词性分类、多种释义及常见搭配。"
+      },
+      "show_detected_lang": {
+        "description": "在回复中显示语种方向",
+        "type": "bool",
+        "default": true
+      },
+      "show_engine_name": {
+        "description": "在回复中显示翻译渠道",
+        "type": "bool",
+        "default": false,
+        "hint": "默认关闭，不在聊天回复中暴露当前使用的翻译接口名称。"
+      },
+      "show_original": {
+        "description": "同时附带原文",
+        "type": "bool",
+        "default": false
+      },
       "mozhi_engine": {
         "description": "Mozhi 后端引擎",
         "type": "string",
@@ -255,21 +354,6 @@
         "type": "string",
         "default": "",
         "hint": "可选填写有效邮箱（作为 MyMemory de 参数），有助于提升免费额度上限。"
-      },
-      "show_engine_name": {
-        "description": "在回复中显示翻译引擎",
-        "type": "bool",
-        "default": true
-      },
-      "show_detected_lang": {
-        "description": "在回复中显示语种方向",
-        "type": "bool",
-        "default": true
-      },
-      "show_original": {
-        "description": "同时附带原文",
-        "type": "bool",
-        "default": false
       },
       "timeout_seconds": {
         "description": "单次请求超时时间（秒）",

@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import hmac
 import html
 import json
+import random
 import re
 import time
 import urllib.parse
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 import aiohttp
@@ -24,6 +30,16 @@ DEFAULT_LLM_PROMPT = (
     "You are a professional translator. Translate the user's text into "
     "{target_lang} accurately and naturally, preserving paragraph breaks and "
     "formatting. Output ONLY the translated text without explanations."
+)
+
+DEFAULT_LLM_DICT_PROMPT = (
+    "You are a concise bilingual dictionary and translator. The user provided a "
+    "word or short phrase to translate into {target_lang}. Output:\n"
+    "1. Primary translation and phonetic transcription / reading (if applicable).\n"
+    "2. Common meanings grouped by part of speech (e.g. n., v., adj., adv., prep.) "
+    "with multiple senses per part of speech.\n"
+    "3. 1-2 short collocations or brief bilingual examples if helpful.\n"
+    "Keep the output clean, well-structured, and free of filler."
 )
 
 
@@ -41,6 +57,8 @@ class ProviderPreset:
     kind: str
     requires_key: bool = False
     default_sub_engine: str = ""
+    default_model: str = ""
+    model_config_key: str = ""
 
 
 PROVIDER_PRESETS: dict[str, ProviderPreset] = {
@@ -107,6 +125,61 @@ PROVIDER_PRESETS: dict[str, ProviderPreset] = {
         default_url="https://lingva.ml/api/v1",
         kind="lingva",
     ),
+    "zhipu_free": ProviderPreset(
+        key="zhipu_free",
+        name="智谱 AI (免费模型)",
+        default_url="https://open.bigmodel.cn/api/paas/v4/chat/completions",
+        kind="openai_compat",
+        requires_key=True,
+        default_model="GLM-4-Flash-250414",
+        model_config_key="zhipu_model",
+    ),
+    "siliconflow_free": ProviderPreset(
+        key="siliconflow_free",
+        name="硅基流动 (免费模型)",
+        default_url="https://api.siliconflow.cn/v1/chat/completions",
+        kind="openai_compat",
+        requires_key=True,
+        default_model="tencent/Hunyuan-MT-7B",
+        model_config_key="siliconflow_model",
+    ),
+    "groq_free": ProviderPreset(
+        key="groq_free",
+        name="Groq (免费开源模型)",
+        default_url="https://api.groq.com/openai/v1/chat/completions",
+        kind="openai_compat",
+        requires_key=True,
+        default_model="openai/gpt-oss-120b",
+        model_config_key="groq_model",
+    ),
+    "niutrans": ProviderPreset(
+        key="niutrans",
+        name="小牛翻译",
+        default_url="https://api.niutrans.com/NiuTransServer/translation",
+        kind="niutrans",
+        requires_key=True,
+    ),
+    "volcengine": ProviderPreset(
+        key="volcengine",
+        name="火山引擎机器翻译",
+        default_url="https://translate.volcengineapi.com",
+        kind="volcengine",
+        requires_key=True,
+    ),
+    "baidu_fanyi": ProviderPreset(
+        key="baidu_fanyi",
+        name="百度翻译开放平台",
+        default_url="https://fanyi-api.baidu.com/api/trans/vip/translate",
+        kind="baidu_fanyi",
+        requires_key=True,
+    ),
+    "aliyun_mt": ProviderPreset(
+        key="aliyun_mt",
+        name="阿里云机器翻译",
+        default_url="https://mt.cn-hangzhou.aliyuncs.com",
+        kind="aliyun_mt",
+        requires_key=True,
+    ),
     "libretranslate": ProviderPreset(
         key="libretranslate",
         name="LibreTranslate",
@@ -124,6 +197,8 @@ PROVIDER_PRESETS: dict[str, ProviderPreset] = {
         name="OpenAI 兼容接口",
         default_url="https://api.openai.com/v1/chat/completions",
         kind="openai_compat",
+        default_model="gpt-4o-mini",
+        model_config_key="openai_model",
     ),
     "astrbot_llm": ProviderPreset(
         key="astrbot_llm",
@@ -402,6 +477,53 @@ _YOUDAO_ZH_PREFIX = {
     "es": "SP",
 }
 
+_NIUTRANS_LANG_MAP = {
+    "zh-CN": "zh",
+    "zh-TW": "cht",
+}
+
+_VOLCENGINE_LANG_MAP = {
+    "zh-CN": "zh",
+    "zh-TW": "zh-Hant",
+}
+
+_BAIDU_LANG_MAP = {
+    "zh-CN": "zh",
+    "zh-TW": "cht",
+    "ja": "jp",
+    "ko": "kor",
+    "fr": "fra",
+    "es": "spa",
+    "ar": "ara",
+    "vi": "vie",
+    "ro": "rom",
+    "da": "dan",
+    "fi": "fin",
+    "sv": "swe",
+    "ms": "may",
+    "no": "nor",
+    "he": "heb",
+    "uk": "ukr",
+}
+
+_ALIYUN_LANG_MAP = {
+    "zh-CN": "zh",
+    "zh-TW": "zh-tw",
+}
+
+_BING_POS_LABELS = {
+    "NOUN": "n.",
+    "VERB": "v.",
+    "ADJ": "adj.",
+    "ADV": "adv.",
+    "PREP": "prep.",
+    "CONJ": "conj.",
+    "PRON": "pron.",
+    "INTJ": "intj.",
+    "DET": "det.",
+    "OTHER": "释义",
+}
+
 
 @dataclass
 class ParsedCommand:
@@ -425,6 +547,7 @@ class TranslationResult:
     detected_lang: str = ""
     fallback_used: bool = False
     errors: list[str] | None = None
+    dict_entries: list[str] | None = None
 
 
 def normalize_lang(raw: str | None, allow_auto: bool = True) -> str | None:
@@ -637,6 +760,54 @@ def redact_secret(message: str, secret: str | None) -> str:
     return masked
 
 
+def redact_config_secrets(message: str, config: dict[str, Any]) -> str:
+    """Mask all credential fields configured in plugin config."""
+    out = message
+    for key in ("api_key", "volcengine_secret_key", "aliyun_access_secret"):
+        val = str(config.get(key) or "").strip()
+        if val:
+            out = redact_secret(out, val)
+    return out
+
+
+def is_word_or_phrase(text: str) -> bool:
+    """Return True when text looks like a single word or short phrase suitable for dictionary lookup."""
+    s = (text or "").strip()
+    if not s or "\n" in s or "\r" in s:
+        return False
+    if re.search(r"https?://|@", s, re.IGNORECASE):
+        return False
+    if re.search(r"[。！？；.!?;，,、]", s):
+        return False
+    if not re.search(r"[A-Za-z\u3040-\u30ff\u4e00-\u9fff\uac00-\ud7af\u0400-\u04ff]", s):
+        return False
+    if re.search(r"[\u3040-\u30ff\u4e00-\u9fff\uac00-\ud7af]", s):
+        return len(s) <= 8
+    tokens = s.split()
+    return 1 <= len(tokens) <= 4 and len(s) <= 48
+
+
+def _truncate_senses(raw: str, max_senses: int = 5, max_len: int = 88) -> str:
+    """Keep a dictionary definition concise without cutting mid-word or mid-clause."""
+    cleaned = re.sub(r"\s+", " ", raw).strip()
+    if len(cleaned) <= max_len:
+        return cleaned
+    parts = [p.strip() for p in re.split(r"[；;]", cleaned) if p.strip()]
+    if len(parts) > 1:
+        kept: list[str] = []
+        total = 0
+        for part in parts[:max_senses]:
+            add_len = len(part) + (1 if kept else 0)
+            if kept and total + add_len > max_len:
+                break
+            kept.append(part)
+            total += add_len
+        if kept:
+            joined = "；".join(kept)
+            return joined + ("…" if len(kept) < len(parts) else "")
+    return cleaned[: max_len - 1].rstrip() + "…"
+
+
 def _render_template(
     template: str,
     variables: dict[str, str],
@@ -762,7 +933,7 @@ class TranslationService:
         config: dict[str, Any],
         source_lang: str = "auto",
         target_lang: str | None = None,
-        llm_callback: Callable[[str, str, str], Awaitable[str]] | None = None,
+        llm_callback: Callable[..., Awaitable[str]] | None = None,
     ) -> TranslationResult:
         """Translate text via configured primary API with optional auto fallback."""
         default_target = str(config.get("default_target_lang") or "auto_zh_en")
@@ -771,6 +942,9 @@ class TranslationService:
         primary = str(config.get("api_provider") or "bing_cn")
         if primary not in PROVIDER_PRESETS:
             primary = "bing_cn"
+
+        adv = config.get("advanced") or {}
+        dict_mode = bool(adv.get("enable_dict_lookup", True)) and is_word_or_phrase(text)
 
         chain = [primary]
         if config.get("enable_auto_fallback", True):
@@ -790,10 +964,20 @@ class TranslationService:
                     config=config,
                     use_custom_override=(idx == 0),
                     llm_callback=llm_callback,
+                    dict_mode=dict_mode,
                 )
                 cleaned = translated.strip()
                 if not cleaned:
                     raise TranslationError("返回译文为空")
+                dict_entries: list[str] | None = None
+                if dict_mode and preset.kind not in {"openai_compat", "astrbot_llm"}:
+                    dict_entries = await self._lookup_dictionary(
+                        text=text.strip(),
+                        source_lang=source_lang,
+                        target_lang=resolved_target,
+                        detected_lang=detected,
+                        config=config,
+                    ) or None
                 return TranslationResult(
                     translated_text=cleaned,
                     provider_key=preset.key,
@@ -803,9 +987,10 @@ class TranslationService:
                     detected_lang=detected,
                     fallback_used=(idx > 0),
                     errors=errors or None,
+                    dict_entries=dict_entries,
                 )
             except Exception as exc:
-                safe_err = redact_secret(str(exc), str(config.get("api_key") or "").strip())
+                safe_err = redact_config_secrets(str(exc), config)
                 errors.append(f"{preset.name}: {safe_err}")
 
         raise TranslationError("；".join(errors) if errors else "所有翻译接口均请求失败")
@@ -818,7 +1003,8 @@ class TranslationService:
         target_lang: str,
         config: dict[str, Any],
         use_custom_override: bool,
-        llm_callback: Callable[[str, str, str], Awaitable[str]] | None,
+        llm_callback: Callable[..., Awaitable[str]] | None,
+        dict_mode: bool = False,
     ) -> tuple[str, str]:
         custom_url = str(config.get("custom_api_url") or "").strip() if use_custom_override else ""
         url = custom_url or preset.default_url
@@ -836,6 +1022,10 @@ class TranslationService:
             "google_clients5": self._translate_google_clients5,
             "mozhi": self._translate_mozhi,
             "lingva": self._translate_lingva,
+            "niutrans": self._translate_niutrans,
+            "volcengine": self._translate_volcengine,
+            "baidu_fanyi": self._translate_baidu_fanyi,
+            "aliyun_mt": self._translate_aliyun_mt,
             "libretranslate": self._translate_libretranslate,
             "deeplx": self._translate_deeplx,
             "openai_compat": self._translate_openai_compat,
@@ -847,7 +1037,10 @@ class TranslationService:
                 raise TranslationError("当前环境不支持内置 LLM 回调")
             src_label = get_lang_label(source_lang)
             tgt_label = get_lang_label(target_lang)
-            out = await llm_callback(text, src_label, tgt_label)
+            try:
+                out = await llm_callback(text, src_label, tgt_label, dict_mode=dict_mode)
+            except TypeError:
+                out = await llm_callback(text, src_label, tgt_label)
             return out, ""
 
         handler = dispatch_map.get(preset.kind)
@@ -861,6 +1054,7 @@ class TranslationService:
             target_lang=target_lang,
             api_key=api_key,
             config=config,
+            dict_mode=dict_mode,
         )
 
     async def _fetch_bing_token(
@@ -1387,7 +1581,7 @@ class TranslationService:
             raise TranslationError("DeepLX 未返回译文")
         return translated, str(data.get("source_lang") or "")
 
-    async def _translate_openai_compat(
+    async def _translate_niutrans(
         self,
         url: str,
         text: str,
@@ -1397,6 +1591,299 @@ class TranslationService:
         config: dict[str, Any],
         **_: Any,
     ) -> tuple[str, str]:
+        if not api_key:
+            raise TranslationError("请先在配置页填写小牛翻译 API Key")
+
+        req_url = url.rstrip("/")
+        parsed = urllib.parse.urlparse(req_url)
+        if not parsed.path:
+            req_url = f"{req_url}/NiuTransServer/translation"
+
+        src = _map_lang(source_lang, _NIUTRANS_LANG_MAP)
+        tgt = _map_lang(target_lang, _NIUTRANS_LANG_MAP)
+        session = await self._get_session()
+
+        async def _send_niutrans(chunk: str) -> tuple[str, str]:
+            payload = {
+                "from": src,
+                "to": tgt,
+                "apikey": api_key,
+                "src_text": chunk,
+            }
+            async with session.post(
+                req_url,
+                json=payload,
+                headers={"User-Agent": DEFAULT_UA, "Accept": "application/json"},
+                proxy=self._request_proxy(req_url, config),
+                timeout=self._timeout(config),
+            ) as resp:
+                data = await self._read_json_response(
+                    resp, "小牛翻译", allow_error_json=True
+                )
+
+            if data.get("error_code"):
+                msg = data.get("error_msg") or data.get("error_code")
+                raise TranslationError(f"小牛翻译错误 ({data.get('error_code')}): {msg}")
+            translated = str(data.get("tgt_text") or "")
+            if not translated:
+                raise TranslationError("小牛翻译未返回译文")
+            detected = str(data.get("from") or "") if source_lang == "auto" else ""
+            return translated, detected
+
+        return await self._translate_chunked(text, 1500, _send_niutrans)
+
+    @staticmethod
+    def _volc_hmac_sha256(key: bytes, msg: str) -> bytes:
+        return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+
+    async def _translate_volcengine(
+        self,
+        url: str,
+        text: str,
+        source_lang: str,
+        target_lang: str,
+        api_key: str,
+        config: dict[str, Any],
+        **_: Any,
+    ) -> tuple[str, str]:
+        secret_key = str(config.get("volcengine_secret_key") or "").strip()
+        if not api_key or not secret_key:
+            raise TranslationError("请先在配置页填写火山引擎 AccessKey ID 与 Secret AccessKey")
+
+        parsed = urllib.parse.urlparse(url.rstrip("/"))
+        host = parsed.netloc
+        path = parsed.path or "/"
+        base_url = f"{parsed.scheme}://{host}{path}"
+        region = "cn-north-1"
+        service = "translate"
+        query_params = {"Action": "TranslateText", "Version": "2020-06-01"}
+        canonical_query = "&".join(
+            f"{urllib.parse.quote(k, safe='-_.~')}={urllib.parse.quote(v, safe='-_.~')}"
+            for k, v in sorted(query_params.items())
+        )
+        tgt = _map_lang(target_lang, _VOLCENGINE_LANG_MAP)
+        src = _map_lang(source_lang, _VOLCENGINE_LANG_MAP) if source_lang != "auto" else ""
+        session = await self._get_session()
+
+        async def _send_volc(chunk: str) -> tuple[str, str]:
+            body_obj: dict[str, Any] = {
+                "TargetLanguage": tgt,
+                "TextList": [chunk],
+            }
+            if src:
+                body_obj["SourceLanguage"] = src
+            body_bytes = json.dumps(body_obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+            x_date = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            short_date = x_date[:8]
+            content_type = "application/json"
+            payload_hash = hashlib.sha256(body_bytes).hexdigest()
+            signed_headers = "content-type;host;x-content-sha256;x-date"
+            canonical_headers = (
+                f"content-type:{content_type}\n"
+                f"host:{host}\n"
+                f"x-content-sha256:{payload_hash}\n"
+                f"x-date:{x_date}\n"
+            )
+            canonical_req = "\n".join(
+                [
+                    "POST",
+                    path,
+                    canonical_query,
+                    canonical_headers,
+                    signed_headers,
+                    payload_hash,
+                ]
+            )
+            credential_scope = f"{short_date}/{region}/{service}/request"
+            string_to_sign = "\n".join(
+                [
+                    "HMAC-SHA256",
+                    x_date,
+                    credential_scope,
+                    hashlib.sha256(canonical_req.encode("utf-8")).hexdigest(),
+                ]
+            )
+            k_date = self._volc_hmac_sha256(secret_key.encode("utf-8"), short_date)
+            k_region = self._volc_hmac_sha256(k_date, region)
+            k_service = self._volc_hmac_sha256(k_region, service)
+            k_signing = self._volc_hmac_sha256(k_service, "request")
+            signature = self._volc_hmac_sha256(k_signing, string_to_sign).hex()
+
+            headers = {
+                "Host": host,
+                "Content-Type": content_type,
+                "X-Date": x_date,
+                "X-Content-Sha256": payload_hash,
+                "Authorization": (
+                    f"HMAC-SHA256 Credential={api_key}/{credential_scope}, "
+                    f"SignedHeaders={signed_headers}, Signature={signature}"
+                ),
+            }
+            req_url = f"{base_url}?{canonical_query}"
+            async with session.post(
+                req_url,
+                data=body_bytes,
+                headers=headers,
+                proxy=self._request_proxy(req_url, config),
+                timeout=self._timeout(config),
+            ) as resp:
+                data = await self._read_json_response(
+                    resp, "火山引擎机器翻译", allow_error_json=True
+                )
+
+            meta_err = (data.get("ResponseMetadata") or {}).get("Error")
+            if isinstance(meta_err, dict) and (meta_err.get("Code") or meta_err.get("Message")):
+                raise TranslationError(
+                    f"火山引擎错误 ({meta_err.get('Code', '')}): {meta_err.get('Message', '')}"
+                )
+            items = data.get("TranslationList") or []
+            if not items or not isinstance(items[0], dict):
+                raise TranslationError("火山引擎未返回译文")
+            translated = str(items[0].get("Translation") or "")
+            detected = str(items[0].get("DetectedSourceLanguage") or "")
+            return translated, detected
+
+        return await self._translate_chunked(text, 1500, _send_volc)
+
+    async def _translate_baidu_fanyi(
+        self,
+        url: str,
+        text: str,
+        source_lang: str,
+        target_lang: str,
+        api_key: str,
+        config: dict[str, Any],
+        **_: Any,
+    ) -> tuple[str, str]:
+        app_id = str(config.get("baidu_app_id") or "").strip()
+        if not app_id or not api_key:
+            raise TranslationError("请先在配置页填写百度翻译 APP ID 与密钥")
+
+        src = _map_lang(source_lang, _BAIDU_LANG_MAP)
+        tgt = _map_lang(target_lang, _BAIDU_LANG_MAP)
+        session = await self._get_session()
+
+        async def _send_baidu(chunk: str) -> tuple[str, str]:
+            salt = str(random.randint(100000, 999999))
+            sign = hashlib.md5(f"{app_id}{chunk}{salt}{api_key}".encode("utf-8")).hexdigest()
+            form = {
+                "q": chunk,
+                "from": src,
+                "to": tgt,
+                "appid": app_id,
+                "salt": salt,
+                "sign": sign,
+            }
+            async with session.post(
+                url,
+                data=form,
+                headers={"User-Agent": DEFAULT_UA, "Accept": "application/json"},
+                proxy=self._request_proxy(url, config),
+                timeout=self._timeout(config),
+            ) as resp:
+                data = await self._read_json_response(
+                    resp, "百度翻译", allow_error_json=True
+                )
+
+            if data.get("error_code"):
+                raise TranslationError(
+                    f"百度翻译错误 ({data.get('error_code')}): {data.get('error_msg', '')}"
+                )
+            items = data.get("trans_result") or []
+            if not items:
+                raise TranslationError("百度翻译未返回译文")
+            translated = "\n".join(str(item.get("dst") or "") for item in items if isinstance(item, dict))
+            detected = str(data.get("from") or "") if source_lang == "auto" else ""
+            return translated, detected
+
+        return await self._translate_chunked(text, 1500, _send_baidu)
+
+    @staticmethod
+    def _aliyun_quote(val: str) -> str:
+        return urllib.parse.quote(val, safe="-_.~")
+
+    async def _translate_aliyun_mt(
+        self,
+        url: str,
+        text: str,
+        source_lang: str,
+        target_lang: str,
+        api_key: str,
+        config: dict[str, Any],
+        **_: Any,
+    ) -> tuple[str, str]:
+        access_secret = str(config.get("aliyun_access_secret") or "").strip()
+        if not api_key or not access_secret:
+            raise TranslationError("请先在配置页填写阿里云 AccessKey ID 与 AccessKey Secret")
+
+        req_url = url.rstrip("/") + "/"
+        src = _map_lang(source_lang, _ALIYUN_LANG_MAP)
+        tgt = _map_lang(target_lang, _ALIYUN_LANG_MAP)
+        session = await self._get_session()
+
+        async def _send_aliyun(chunk: str) -> tuple[str, str]:
+            params = {
+                "Action": "TranslateGeneral",
+                "Version": "2018-10-12",
+                "Format": "JSON",
+                "FormatType": "text",
+                "Scene": "general",
+                "SourceLanguage": src,
+                "TargetLanguage": tgt,
+                "SourceText": chunk,
+                "AccessKeyId": api_key,
+                "Timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "SignatureMethod": "HMAC-SHA1",
+                "SignatureVersion": "1.0",
+                "SignatureNonce": uuid.uuid4().hex,
+            }
+            canonical = "&".join(
+                f"{self._aliyun_quote(k)}={self._aliyun_quote(v)}"
+                for k, v in sorted(params.items())
+            )
+            string_to_sign = f"POST&%2F&{self._aliyun_quote(canonical)}"
+            digest = hmac.new(
+                f"{access_secret}&".encode("utf-8"),
+                string_to_sign.encode("utf-8"),
+                hashlib.sha1,
+            ).digest()
+            params["Signature"] = base64.b64encode(digest).decode("utf-8")
+
+            async with session.post(
+                req_url,
+                data=params,
+                headers={"User-Agent": DEFAULT_UA, "Accept": "application/json"},
+                proxy=self._request_proxy(req_url, config),
+                timeout=self._timeout(config),
+            ) as resp:
+                data = await self._read_json_response(
+                    resp, "阿里云机器翻译", allow_error_json=True
+                )
+
+            code = str(data.get("Code") or "")
+            if code and code != "200":
+                raise TranslationError(f"阿里云翻译错误 ({code}): {data.get('Message', '')}")
+            translated = str(((data.get("Data") or {}).get("Translated")) or "")
+            if not translated:
+                raise TranslationError("阿里云机器翻译未返回译文")
+            detected = str(((data.get("Data") or {}).get("DetectedLanguage")) or "")
+            return translated, detected
+
+        return await self._translate_chunked(text, 1500, _send_aliyun)
+
+    async def _translate_openai_compat(
+        self,
+        preset: ProviderPreset,
+        url: str,
+        text: str,
+        source_lang: str,
+        target_lang: str,
+        api_key: str,
+        config: dict[str, Any],
+        dict_mode: bool = False,
+        **_: Any,
+    ) -> tuple[str, str]:
         req_url = url.rstrip("/")
         if not req_url.endswith("/chat/completions"):
             if re.search(r"/(?:v\d+(?:alpha|beta)?|openai)$", req_url, re.IGNORECASE):
@@ -1404,8 +1891,19 @@ class TranslationService:
             else:
                 req_url = f"{req_url}/v1/chat/completions"
 
-        model = str(config.get("openai_model") or "gpt-4o-mini").strip()
-        prompt_tpl = str(config.get("openai_system_prompt") or DEFAULT_LLM_PROMPT)
+        model_key = preset.model_config_key or "openai_model"
+        model = str(config.get(model_key) or preset.default_model or "gpt-4o-mini").strip()
+
+        custom_prompt = (
+            str(config.get("openai_system_prompt") or "").strip()
+            if preset.key == "openai_compat"
+            else ""
+        )
+        if custom_prompt and custom_prompt != DEFAULT_LLM_PROMPT:
+            prompt_tpl = custom_prompt
+        else:
+            prompt_tpl = DEFAULT_LLM_DICT_PROMPT if dict_mode else DEFAULT_LLM_PROMPT
+
         system_prompt = prompt_tpl.replace(
             "{target_lang}", get_lang_label(target_lang)
         ).replace("{source_lang}", get_lang_label(source_lang))
@@ -1524,3 +2022,216 @@ class TranslationService:
         if isinstance(extracted, list):
             extracted = "".join(str(x) for x in extracted)
         return str(extracted), ""
+
+    async def _lookup_dictionary(
+        self,
+        text: str,
+        source_lang: str,
+        target_lang: str,
+        detected_lang: str,
+        config: dict[str, Any],
+    ) -> list[str]:
+        """Fetch multi-POS dictionary senses for words/phrases without failing main translation."""
+        src_hint = (
+            source_lang
+            if source_lang != "auto"
+            else (normalize_lang(detected_lang, allow_auto=False) or detect_script_lang(text))
+        )
+        if src_hint == target_lang:
+            return []
+
+        prefer_youdao = target_lang == "zh-CN" and src_hint in {"en", "ja", "fr"}
+        try:
+            if prefer_youdao:
+                entries = await self._fetch_youdao_dict(text, src_hint, target_lang, config)
+                if entries:
+                    return entries
+                return await self._fetch_bing_dict(text, src_hint, target_lang, config)
+
+            entries = await self._fetch_bing_dict(text, src_hint, target_lang, config)
+            if entries:
+                return entries
+            if target_lang == "zh-CN" or (src_hint == "zh-CN" and target_lang == "en"):
+                return await self._fetch_youdao_dict(text, src_hint, target_lang, config)
+        except Exception:
+            return []
+        return []
+
+    async def _fetch_youdao_dict(
+        self,
+        text: str,
+        src_hint: str,
+        target_lang: str,
+        config: dict[str, Any],
+    ) -> list[str]:
+        if target_lang not in {"zh-CN", "en"}:
+            return []
+
+        params: dict[str, str] = {"q": text}
+        if src_hint == "ja":
+            params["le"] = "jap"
+        elif src_hint == "fr":
+            params["le"] = "fr"
+
+        url = "https://dict.youdao.com/jsonapi"
+        session = await self._get_session()
+        async with session.get(
+            url,
+            params=params,
+            headers={"User-Agent": DEFAULT_UA, "Accept": "application/json"},
+            proxy=self._request_proxy(url, config),
+            timeout=aiohttp.ClientTimeout(total=5),
+        ) as resp:
+            if resp.status != 200:
+                return []
+            data = json.loads(await resp.text(errors="ignore"))
+
+        if not isinstance(data, dict):
+            return []
+
+        lines: list[str] = []
+        if target_lang == "zh-CN" and src_hint == "en" and isinstance(data.get("ec"), dict):
+            word_list = data["ec"].get("word") or []
+            if word_list and isinstance(word_list[0], dict):
+                entry = word_list[0]
+                phones: list[str] = []
+                if entry.get("ukphone"):
+                    phones.append(f"英 /{entry['ukphone']}/")
+                if entry.get("usphone"):
+                    phones.append(f"美 /{entry['usphone']}/")
+                if phones:
+                    lines.append("  ".join(phones))
+
+                for tr_item in (entry.get("trs") or [])[:6]:
+                    inner = (tr_item.get("tr") or [{}])[0] if isinstance(tr_item, dict) else {}
+                    vals = (inner.get("l") or {}).get("i") or []
+                    text_val = " ".join(str(x) for x in vals if isinstance(x, str)).strip()
+                    if text_val:
+                        lines.append(f"• {_truncate_senses(text_val)}")
+
+            phrs_block = (data.get("phrs") or {}).get("phrs") or []
+            phrase_items: list[str] = []
+            for p_item in phrs_block[:3]:
+                phr = p_item.get("phr") if isinstance(p_item, dict) else None
+                if not isinstance(phr, dict):
+                    continue
+                head = ((phr.get("headword") or {}).get("l") or {}).get("i")
+                trs = phr.get("trs") or []
+                meaning = ((trs[0].get("tr") or {}).get("l") or {}).get("i") if trs else None
+                if isinstance(head, str) and isinstance(meaning, str) and head and meaning:
+                    phrase_items.append(f"{head} ({_truncate_senses(meaning, max_senses=2, max_len=28)})")
+            if phrase_items and len(lines) > 0:
+                lines.append("常见搭配：" + "、".join(phrase_items))
+            return lines if lines else []
+
+        if target_lang == "zh-CN" and src_hint in {"ja", "fr"}:
+            section_key = "jc" if src_hint == "ja" else "fc"
+            sec = data.get(section_key)
+            word_list = sec.get("word") or [] if isinstance(sec, dict) else []
+            if word_list and isinstance(word_list[0], dict):
+                entry = word_list[0]
+                reading = ((entry.get("return-phrase") or {}).get("l") or {}).get("i")
+                phone = entry.get("phone")
+                header_parts: list[str] = []
+                if isinstance(reading, str) and reading and reading != text:
+                    sup = entry.get("phonesup") or ""
+                    header_parts.append(f"{reading}{sup}")
+                if isinstance(phone, str) and phone:
+                    header_parts.append(f"/{phone}/")
+                if header_parts:
+                    lines.append("  ".join(header_parts))
+
+                for tr_grp in (entry.get("trs") or [])[:6]:
+                    if not isinstance(tr_grp, dict):
+                        continue
+                    pos = str(tr_grp.get("pos") or "").strip()
+                    meanings: list[str] = []
+                    for sub in tr_grp.get("tr") or []:
+                        vals = ((sub.get("l") or {}).get("i") or []) if isinstance(sub, dict) else []
+                        meanings.extend(str(v).strip() for v in vals if isinstance(v, str) and v.strip())
+                    if meanings:
+                        prefix = f"[{pos}] " if pos else ""
+                        lines.append(f"• {prefix}{_truncate_senses('；'.join(meanings))}")
+                return lines
+
+        if target_lang == "en" and src_hint == "zh-CN" and isinstance(data.get("ce"), dict):
+            word_list = data["ce"].get("word") or []
+            if word_list and isinstance(word_list[0], dict):
+                entry = word_list[0]
+                if entry.get("phone"):
+                    lines.append(f"/{entry['phone']}/")
+                for tr_item in (entry.get("trs") or [])[:5]:
+                    inner = (tr_item.get("tr") or [{}])[0] if isinstance(tr_item, dict) else {}
+                    l_obj = inner.get("l") or {}
+                    pos = str(l_obj.get("pos") or "").strip()
+                    words = [
+                        str(tok.get("#text")).strip()
+                        for tok in (l_obj.get("i") or [])
+                        if isinstance(tok, dict) and tok.get("#text")
+                    ]
+                    tran = str(l_obj.get("#tran") or "").strip()
+                    if words:
+                        prefix = f"{pos} " if pos else ""
+                        gloss = f"（{_truncate_senses(tran, max_senses=2, max_len=30)}）" if tran else ""
+                        lines.append(f"• {prefix}{', '.join(words)}{gloss}")
+                return lines
+
+        return []
+
+    async def _fetch_bing_dict(
+        self,
+        text: str,
+        src_hint: str,
+        target_lang: str,
+        config: dict[str, Any],
+    ) -> list[str]:
+        src = _map_lang(src_hint, _BING_LANG_MAP)
+        tgt = _map_lang(target_lang, _BING_LANG_MAP)
+        if not src or src == "auto-detect" or src == tgt:
+            return []
+
+        tok = await self._fetch_bing_token("https://cn.bing.com", config)
+        req_url = (
+            f"{tok['origin']}/tlookupv3?isVertical=1&IG={tok['ig']}"
+            f"&IID={tok['iid']}&SFX={tok['sfx']}"
+        )
+        headers = {
+            "User-Agent": DEFAULT_UA,
+            "Origin": tok["origin"],
+            "Referer": f"{tok['origin']}/translator",
+            "Accept": "*/*",
+        }
+        form = {"from": src, "to": tgt, "text": text, "token": tok["token"], "key": tok["key"]}
+
+        session = await self._get_session()
+        async with session.post(
+            req_url,
+            data=form,
+            headers=headers,
+            proxy=self._request_proxy(req_url, config),
+            timeout=aiohttp.ClientTimeout(total=5),
+        ) as resp:
+            if resp.status != 200:
+                return []
+            data = json.loads(await resp.text(errors="ignore"))
+
+        if not isinstance(data, list) or not data or not isinstance(data[0], dict):
+            return []
+        translations = data[0].get("translations") or []
+        if not translations:
+            return []
+
+        grouped: dict[str, list[str]] = {}
+        for item in translations:
+            if not isinstance(item, dict):
+                continue
+            target_word = str(item.get("displayTarget") or item.get("normalizedTarget") or "").strip()
+            if not target_word:
+                continue
+            raw_pos = str(item.get("posTag") or "OTHER").upper()
+            pos_label = _BING_POS_LABELS.get(raw_pos, raw_pos.lower())
+            bucket = grouped.setdefault(pos_label, [])
+            if target_word not in bucket and len(bucket) < 6:
+                bucket.append(target_word)
+
+        return [f"• {pos} {'；'.join(words)}" for pos, words in list(grouped.items())[:6]]
